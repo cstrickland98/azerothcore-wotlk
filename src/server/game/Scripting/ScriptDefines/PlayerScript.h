@@ -235,6 +235,7 @@ enum PlayerHook
     PLAYERHOOK_ON_BEFORE_RECEIVE_SPELL_LIST_FROM_TRAINER,
     PLAYERHOOK_ON_GET_TRAINER_SPELL_STATE,
     PLAYERHOOK_ON_AFTER_TRAIN_SPELL,
+    PLAYERHOOK_CAN_UPDATE_OWN_VISIBILITY_ON_RELOCATION,
     PLAYERHOOK_END
 };
 
@@ -966,6 +967,23 @@ public:
      * @param spellId The id of the trainer spell that was bought
      */
     virtual void OnPlayerAfterTrainSpell(Player* /*player*/, Creature* /*trainer*/, uint32 /*spellId*/) {}
+
+    /**
+     * @brief This hook is called when a player's delayed relocation notify runs after it moved,
+     *        before the player re-evaluates which nearby objects it can see.
+     *
+     * Returning false skips only that re-evaluation for this pass: the player's own visible set
+     * (HaveAtClient, the create/out-of-range packets to its client) keeps its previous content
+     * until a later pass is allowed or the objects update it from their side. Nearby players
+     * still re-evaluate whether they see this player, grids are still loaded and creature AI
+     * still gets its relocation notify (MoveInLineOfSight). Meant for players without a client;
+     * never return false for a player with a connected client.
+     *
+     * @param player Contains information about the Player
+     *
+     * @return true to run the player's own visibility update for this relocation
+     */
+    [[nodiscard]] virtual bool OnPlayerCanUpdateOwnVisibilityOnRelocation(Player* /*player*/) { return true; }
 };
 
 #endif

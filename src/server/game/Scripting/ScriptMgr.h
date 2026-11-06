@@ -485,6 +485,7 @@ public: /* PlayerScript */
     void OnPlayerBeforeReceiveSpellListFromTrainer(Player* player, Creature* trainer, WorldPackets::NPC::TrainerList& trainerList);
     void OnPlayerGetTrainerSpellState(Player const* player, uint32 trainerId, uint32 spellId, Trainer::SpellState& state);
     void OnPlayerAfterTrainSpell(Player* player, Creature* trainer, uint32 spellId);
+    bool OnPlayerCanUpdateOwnVisibilityOnRelocation(Player* player);
 
     // Anti cheat
     void AnticheatSetCanFlybyServer(Player* player, bool apply);

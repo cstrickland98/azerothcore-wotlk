@@ -16101,10 +16101,20 @@ void Unit::ExecuteDelayedUnitRelocationEvent()
 
         GetMap()->LoadGridsInRange(*player, MAX_VISIBILITY_DISTANCE);
 
-        Acore::PlayerRelocationNotifier notifier(*player);
-        Cell::VisitObjects(player->GetSightPosition().GetPositionX(), player->GetSightPosition().GetPositionY(), player->GetMap(), notifier, player->GetSightRange());
-        Cell::VisitFarVisibleObjects(player->GetSightPosition().GetPositionX(), player->GetSightPosition().GetPositionY(), player->GetMap(), notifier, VISIBILITY_DISTANCE_GIGANTIC);
-        notifier.SendToSelf();
+        if (sScriptMgr->OnPlayerCanUpdateOwnVisibilityOnRelocation(player))
+        {
+            Acore::PlayerRelocationNotifier notifier(*player);
+            Cell::VisitObjects(player->GetSightPosition().GetPositionX(), player->GetSightPosition().GetPositionY(), player->GetMap(), notifier, player->GetSightRange());
+            Cell::VisitFarVisibleObjects(player->GetSightPosition().GetPositionX(), player->GetSightPosition().GetPositionY(), player->GetMap(), notifier, VISIBILITY_DISTANCE_GIGANTIC);
+            notifier.SendToSelf();
+        }
+        else
+        {
+            // Own visible set left as is; nearby players still re-evaluate whether they see us,
+            // as PlayerRelocationNotifier::Visit(PlayerMapType&) does.
+            Acore::VisibleChangesNotifier notifier(*player);
+            Cell::VisitObjects(player, notifier, player->GetSightRange());
+        }
 
         this->AddToNotify(NOTIFY_AI_RELOCATION);
     }
