@@ -32,7 +32,8 @@ void HomeMovementGenerator<Creature>::DoFinalize(Creature* owner)
 {
     owner->GetCombatManager().SetEvadeState(EVADE_STATE_NONE);
     owner->ClearUnitState(UNIT_STATE_EVADE);
-    if (arrived)
+    // Not in world means finalized from CleanupBeforeRemoveFromMap: adding addon auras would assert.
+    if (arrived && owner->IsInWorld())
     {
         owner->LoadCreaturesAddon(true);
         owner->AI()->JustReachedHome();

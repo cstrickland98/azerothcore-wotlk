@@ -270,8 +270,9 @@ void PointMovementGenerator<T>::DoFinalize(T* unit)
         }
     }
 
-    // Only inform AI if this is a real arrival, not a finalize caused by a Pause/Stop
-    if (unit->movespline->Finalized() && !_hasBeenStalled)
+    // Only inform AI if this is a real arrival, not a finalize caused by a Pause/Stop,
+    // and not while the unit is being cleaned up off the map (scripts may cast or add auras)
+    if (unit->movespline->Finalized() && !_hasBeenStalled && unit->IsInWorld())
         MovementInform(unit);
 }
 
