@@ -424,6 +424,10 @@ public:
         m_list.remove(t);
         return *this;
     }
+    [[nodiscard]] bool empty() const
+    {
+        return m_list.empty();
+    }
     std::size_t size()
     {
         return m_list.size();

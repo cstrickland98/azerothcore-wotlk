@@ -182,6 +182,7 @@ void AuraApplication::_HandleEffect(uint8 effIndex, bool apply)
         aurEff->CleanupTriggeredSpells(GetTarget());
     }
     SetNeedClientUpdate();
+    GetBase()->InvalidateStaticOnOwner();
 }
 
 void AuraApplication::BuildUpdatePacket(ByteBuffer& data, bool remove) const
@@ -454,6 +455,7 @@ void Aura::_ApplyForTarget(Unit* target, Unit* caster, AuraApplication* auraApp)
     ASSERT (!IsAppliedOnTarget(target->GetGUID()) && "Aura::_ApplyForTarget: aura musn't be already applied on target");
 
     m_applications[target->GetGUID()] = auraApp;
+    InvalidateStaticOnOwner();
 
     // set infinity cooldown state for spells
     if (m_spellInfo->IsCooldownStartedOnEvent() && !m_castItemGuid && caster)
@@ -490,6 +492,7 @@ void Aura::_UnapplyForTarget(Unit* target, Unit* caster, AuraApplication* auraAp
     m_applications.erase(itr);
 
     m_removedApplications.push_back(auraApp);
+    InvalidateStaticOnOwner();
 
     // reset cooldown state for spells
     if (m_spellInfo->IsCooldownStartedOnEvent() && !m_castItemGuid && caster)
@@ -824,6 +827,19 @@ void Aura::UpdateOwner(uint32 diff, WorldObject* owner)
         ABORT();
     }
 
+    // Talents, passives, racials, equip and set spells are most of a player's auras, and all of
+    // them are permanent, non-periodic and applied to the owner alone. Nothing below changes for
+    // such an aura: Update() keys on a positive duration, the owner-only target map is settled
+    // (UpdateTargetMap would only re-run CanBeAppliedOn, which holds without area-target scripts)
+    // and AuraEffect::Update only ticks periodic effects. Skip the caster lookup and the rest.
+    // The answer is cached: evaluating it reads the effects, the application and the scripts,
+    // which costs about as much as the update it saves. Every writer of those resets the cache.
+    if (m_staticOnOwner < 0)
+        m_staticOnOwner = IsStaticOnOwner();
+
+    if (m_staticOnOwner)
+        return;
+
     Unit* caster = GetCaster();
     // Apply spellmods for channeled auras
     // used for example when triggered spell of spell:10 is modded
@@ -938,6 +954,7 @@ void Aura::SetDuration(int32 duration, bool withMods)
                 modOwner->ApplySpellMod(GetId(), SPELLMOD_DURATION, duration);
     }
     m_duration = duration;
+    InvalidateStaticOnOwner();
     SetNeedClientUpdateForTargets();
 }
 
@@ -1162,6 +1179,23 @@ bool Aura::IsOwnerOnlyUnitAura() const
     return true;
 }
 
+bool Aura::IsStaticOnOwner() const
+{
+    if (m_duration >= 0 || GetType() != UNIT_AURA_TYPE || m_applications.size() != 1 || !m_removedApplications.empty())
+        return false;
+
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        if (m_effects[i] && m_effects[i]->IsPeriodic())
+            return false;
+
+    for (AuraScript* script : m_loadedScripts)
+        if (!script->DoCheckAreaTarget.empty())
+            return false;
+
+    AuraApplication const* ownerApp = m_applications.begin()->second;
+    return ownerApp->GetTarget() == GetOwner() && ownerApp->GetEffectMask() == GetEffectMask() && IsOwnerOnlyUnitAura();
+}
+
 bool Aura::IsPassive() const
 {
     return GetSpellInfo()->IsPassive();
@@ -1294,6 +1328,7 @@ void Aura::SetLoadedState(int32 maxduration, int32 duration, int32 charges, uint
 {
     m_maxDuration = maxduration;
     m_duration = duration;
+    InvalidateStaticOnOwner();
     m_procCharges = charges;
     m_isUsingCharges = m_procCharges != 0;
     m_stackAmount = stackamount;
@@ -2493,6 +2528,8 @@ void Aura::_DeleteRemovedApplications()
         delete m_removedApplications.front();
         m_removedApplications.pop_front();
     }
+
+    InvalidateStaticOnOwner();
 }
 
 void Aura::LoadScripts()
@@ -2512,6 +2549,8 @@ void Aura::LoadScripts()
         (*itr)->Register();
         ++itr;
     }
+
+    InvalidateStaticOnOwner();
 }
 
 bool Aura::CallScriptCheckAreaTargetHandlers(Unit* target)

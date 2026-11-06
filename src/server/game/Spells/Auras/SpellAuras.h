@@ -158,6 +158,8 @@ public:
     bool HasMoreThanOneEffectForType(AuraType auraType) const;
     bool IsArea() const;
     bool IsOwnerOnlyUnitAura() const; // every effect is SPELL_EFFECT_APPLY_AURA, so the owner is the only target
+    bool IsStaticOnOwner() const; // permanent, applied to the owner alone, nothing to update per tick
+    void InvalidateStaticOnOwner() { m_staticOnOwner = -1; } // called by every writer of what IsStaticOnOwner reads
     bool IsPassive() const;
     bool IsDeathPersistent() const;
     bool IsRemovedOnShapeLost(Unit* target) const;
@@ -272,6 +274,7 @@ protected:
     uint8 const m_casterLevel;                          // Aura level (store caster level for correct show level dep amount)
     uint8 m_procCharges;                                // Aura charges (0 for infinite)
     uint8 m_stackAmount;                                // Aura stack amount
+    int8 m_staticOnOwner = -1;                          // cached IsStaticOnOwner(): -1 unknown, 0 no, 1 yes
 
     AuraEffect* m_effects[3];
     ApplicationMap m_applications;
