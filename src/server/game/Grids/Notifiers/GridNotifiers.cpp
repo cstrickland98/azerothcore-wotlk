@@ -131,6 +131,15 @@ inline void CreatureUnitRelocationWorker(Creature* c, Unit* u)
         return;
     }
 
+    // A creature hostile to no one (IsMoveInLineOfSightDisabled: no script, no SmartAI, non-hostile
+    // faction) runs CreatureAI::MoveInLineOfSight, which only acts on a unit in combat next to it,
+    // or an empty override; the stealth alert below needs a stealthed player. Every other pair would
+    // pay CanSeeOrDetect for nothing.
+    if (c->IsMoveInLineOfSightDisabled() && !u->IsInCombat() && !(u->IsPlayer() && u->HasStealthAura()))
+    {
+        return;
+    }
+
     if (!c->HasUnitState(UNIT_STATE_SIGHTLESS))
     {
         if (c->IsAIEnabled && c->CanSeeOrDetect(u, false, true))
