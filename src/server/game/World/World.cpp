@@ -66,6 +66,7 @@
 #include "MapMgr.h"
 #include "Metric.h"
 #include "MotdMgr.h"
+#include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
 #include "OutdoorPvPMgr.h"
@@ -1142,7 +1143,9 @@ void World::Update(uint32 diff)
     // Record update if recording set in log and diff is greater then minimum set in log
     sWorldUpdateTime.RecordUpdateTime(GameTime::GetGameTimeMS(), diff, sWorldSessionMgr->GetActiveSessionCount());
 
-    DynamicVisibilityMgr::Update(sWorldSessionMgr->GetActiveSessionCount());
+    // The visibility and AI notify delays scale with the load, and players in world without a
+    // session of their own (bots) load the map threads as much as real ones do
+    DynamicVisibilityMgr::Update(std::max<uint32>(sWorldSessionMgr->GetActiveSessionCount(), ObjectAccessor::GetPlayers().size()));
 
     ///- Update the different timers
     for (int i = 0; i < WUPDATE_COUNT; ++i)
