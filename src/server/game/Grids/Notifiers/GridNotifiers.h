@@ -1040,6 +1040,11 @@ namespace Acore
             if (u->IsCreature() && u->IsVehicle())
                 return false;
 
+            // The range test reads the position the cell visit already touched; the group test
+            // reads the unit's fields and its owner's, so it runs only for units in range
+            if (!_source->IsWithinDistInMap(u, _range))
+                return false;
+
             if (_raid)
             {
                 if (!_refUnit->IsInRaidWith(u))
@@ -1048,7 +1053,7 @@ namespace Acore
             else if (!_refUnit->IsInPartyWith(u))
                 return false;
 
-            return !_refUnit->IsHostileTo(u) && u->IsAlive() && _source->IsWithinDistInMap(u, _range);
+            return !_refUnit->IsHostileTo(u) && u->IsAlive();
         }
 
     private:
