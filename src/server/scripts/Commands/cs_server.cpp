@@ -191,13 +191,16 @@ public:
             handler->PSendSysMessage("{} directory located in {}. Total size: {} bytes", subDir, mapPath.generic_string(), folderSize);
         }
 
+        // The default DBC locale is 255 when none was detected, and module slots have a null name
+        // until registered; never shift by, index or print an unregistered locale.
         LocaleConstant defaultLocale = sWorld->GetDefaultDbcLocale();
-        uint32 availableLocalesMask = (1 << defaultLocale);
+        bool const defaultLocaleKnown = IsLocaleRegistered(defaultLocale);
+        uint32 availableLocalesMask = defaultLocaleKnown ? (1 << defaultLocale) : 0;
 
         for (uint8 i = 0; i < TOTAL_LOCALES; ++i)
         {
             LocaleConstant locale = static_cast<LocaleConstant>(i);
-            if (locale == defaultLocale)
+            if (locale == defaultLocale || !IsLocaleRegistered(locale))
                 continue;
 
             if (sWorld->GetAvailableDbcLocale(locale) != defaultLocale)
@@ -210,12 +213,14 @@ public:
             if (!(availableLocalesMask & (1 << i)))
                 continue;
 
-            availableLocales += localeNames[i];
-            if (i != TOTAL_LOCALES - 1)
+            if (!availableLocales.empty())
                 availableLocales += " ";
+            availableLocales += localeNames[i];
         }
 
-        handler->PSendSysMessage("Default DBC locale: {}.\nAll available DBC locales: {}", localeNames[defaultLocale], availableLocales);
+        handler->PSendSysMessage("Default DBC locale: {}.\nAll available DBC locales: {}",
+            defaultLocaleKnown ? localeNames[defaultLocale] : "unknown",
+            availableLocales.empty() ? "<none>" : availableLocales);
 
         handler->PSendSysMessage("Using World DB: {}", sWorld->GetDBVersion());
 
