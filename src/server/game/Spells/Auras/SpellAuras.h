@@ -73,7 +73,7 @@ public:
     void SetRemoveMode(AuraRemoveMode mode) { _removeMode = mode; }
     AuraRemoveMode GetRemoveMode() const {return _removeMode;}
 
-    void SetNeedClientUpdate() { _needClientUpdate = true;}
+    void SetNeedClientUpdate() { _needClientUpdate = true; _target->SetNeedAuraClientUpdate(); }
     bool IsNeedClientUpdate() const { return _needClientUpdate;}
     void BuildUpdatePacket(ByteBuffer& data, bool remove) const;
     void ClientUpdate(bool remove = false);
@@ -159,7 +159,8 @@ public:
     bool IsArea() const;
     bool IsOwnerOnlyUnitAura() const; // every effect is SPELL_EFFECT_APPLY_AURA, so the owner is the only target
     bool IsStaticOnOwner() const; // permanent, applied to the owner alone, nothing to update per tick
-    void InvalidateStaticOnOwner() { m_staticOnOwner = -1; } // called by every writer of what IsStaticOnOwner reads
+    void InvalidateStaticOnOwner(); // called by every writer of what IsStaticOnOwner reads
+    bool IsKnownStaticOnOwner() const { return m_staticOnOwner == 1; }
     bool IsPassive() const;
     bool IsDeathPersistent() const;
     bool IsRemovedOnShapeLost(Unit* target) const;
