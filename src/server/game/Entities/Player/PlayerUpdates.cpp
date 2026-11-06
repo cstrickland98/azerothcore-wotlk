@@ -1194,7 +1194,10 @@ bool Player::UpdatePosition(float x, float y, float z, float orientation,
     if (GetGroup())
         SetGroupUpdateFlag(GROUP_UPDATE_FLAG_POSITION);
 
-    CheckAreaExploreAndOutdoor();
+    // Reads the area and the outdoor state, so run it when the relocation derived them (every 2 yd,
+    // see Map::PlayerRelocation) rather than force the derive on every sub-step
+    if (!IsPositionDataUpdatePending())
+        CheckAreaExploreAndOutdoor();
 
     return true;
 }
@@ -2299,6 +2302,12 @@ void Player::SendUpdateWorldState(uint32 variable, uint32 value) const
     worldstate.VariableID = variable;
     worldstate.Value = value;
     SendDirectMessage(worldstate.Write());
+}
+
+void Player::ProcessPositionDataChanged(PositionFullTerrainStatus const& data)
+{
+    Unit::ProcessPositionDataChanged(data);
+    m_lastPositionDataPos.Relocate(GetPositionX(), GetPositionY(), GetPositionZ());
 }
 
 void Player::ProcessTerrainStatusUpdate()

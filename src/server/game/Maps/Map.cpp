@@ -801,12 +801,17 @@ void Map::RemoveFromMap(Transport* obj, bool remove)
     }
 }
 
+// A player re-derives its terrain status (zone / area / floor / liquid) once it moved this far
+// since the last derive, see PlayerRelocation
+constexpr float PLAYER_POSITION_DATA_REFRESH_DIST_SQ = 2.0f * 2.0f;
+
 void Map::PlayerRelocation(Player* player, float x, float y, float z, float o)
 {
     Cell old_cell(player->GetPositionX(), player->GetPositionY());
     Cell new_cell(x, y);
 
-    if (old_cell.DiffGrid(new_cell) || old_cell.DiffCell(new_cell))
+    bool const cellChanged = old_cell.DiffGrid(new_cell) || old_cell.DiffCell(new_cell);
+    if (cellChanged)
     {
         player->RemoveFromGrid();
 
@@ -819,7 +824,18 @@ void Map::PlayerRelocation(Player* player, float x, float y, float z, float o)
     player->Relocate(x, y, z, o);
     if (player->IsVehicle())
         player->GetVehicleKit()->RelocatePassengers();
-    player->UpdatePositionData();
+
+    // The terrain status is derived lazily, as for creatures: the getters recompute it on demand.
+    // A player relocates on every movement packet and, on a spline (bots, charges, taxi), on every
+    // sub-step, and the VMAP query behind the derive is the biggest cost of the relocation. Derive
+    // eagerly on a cell change or once the player moved far enough for the liquid state to have
+    // changed, so the proactive effects of the derive (swim / underwater aura interrupts, mirror
+    // timers, liquid auras, the explore and outdoor checks) lag by no more than that distance.
+    if (cellChanged || player->GetExactDistSq(player->GetLastPositionDataPos()) >= PLAYER_POSITION_DATA_REFRESH_DIST_SQ)
+        player->UpdatePositionData();
+    else
+        player->SetPositionDataUpdate();
+
     player->UpdateObjectVisibility(false);
 }
 

@@ -2056,6 +2056,8 @@ public:
     bool UpdatePosition(Position const& pos, bool teleport = false) { return UpdatePosition(pos.GetPositionX(), pos.GetPositionY(), pos.GetPositionZ(), pos.GetOrientation(), teleport); }
 
     void ProcessTerrainStatusUpdate() override;
+    void ProcessPositionDataChanged(PositionFullTerrainStatus const& data) override;
+    [[nodiscard]] Position const& GetLastPositionDataPos() const { return m_lastPositionDataPos; }
 
     void SendMessageToSet(WorldPacket const* data, bool self) const override;
     void SendMessageToSetInRange(WorldPacket const* data, float dist, bool self) const override;
@@ -3074,6 +3076,7 @@ private:
     Optional<float> _farSightDistance = { };
 
     bool _wasOutdoor;
+    Position m_lastPositionDataPos; // where the terrain status was last derived, see Map::PlayerRelocation
 
     PlayerSettingMap m_charSettingsMap;
 
