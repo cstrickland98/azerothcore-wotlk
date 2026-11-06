@@ -219,8 +219,11 @@ private:
     void RaisePriority(SmartScriptHolder& e);
     void RetryLater(SmartScriptHolder& e, bool ignoreChanceRoll = false);
 
+    void AddEvent(SmartScriptHolder const& e);
+
     SmartAIEventList mEvents;
     SmartAIEventList mInstallEvents;
+    bool mHasLosEvent = false; // any SMART_EVENT_OOC_LOS / SMART_EVENT_IC_LOS in mEvents
     SmartAIEventList mTimedActionList;
     bool isProcessingTimedActionList;
     Creature* me;

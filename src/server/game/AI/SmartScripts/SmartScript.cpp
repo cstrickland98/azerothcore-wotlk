@@ -5259,7 +5259,7 @@ void SmartScript::InstallEvents()
     if (!mInstallEvents.empty())
     {
         for (SmartAIEventList::iterator i = mInstallEvents.begin(); i != mInstallEvents.end(); ++i)
-            mEvents.push_back(*i);//must be before UpdateTimers
+            AddEvent(*i);//must be before UpdateTimers
 
         mInstallEvents.clear();
     }
@@ -5386,13 +5386,20 @@ void SmartScript::FillScript(SmartAIEventList e, WorldObject* obj, AreaTrigger c
             {
                 if ((1 << (obj->GetMap()->GetSpawnMode() + 1)) & (*i).event.event_flags)
                 {
-                    mEvents.push_back((*i));
+                    AddEvent(*i);
                 }
             }
             continue;
         }
-        mEvents.push_back((*i));//NOTE: 'world(0)' events still get processed in ANY instance mode
+        AddEvent(*i);//NOTE: 'world(0)' events still get processed in ANY instance mode
     }
+}
+
+void SmartScript::AddEvent(SmartScriptHolder const& e)
+{
+    mEvents.push_back(e);
+    if (e.GetEventType() == SMART_EVENT_OOC_LOS || e.GetEventType() == SMART_EVENT_IC_LOS)
+        mHasLosEvent = true;
 }
 
 void SmartScript::GetScript()
@@ -5482,7 +5489,9 @@ void SmartScript::OnInitialize(WorldObject* obj, AreaTrigger const* at)
 
 void SmartScript::OnMoveInLineOfSight(Unit* who)
 {
-    if (!me)
+    // Called for every unit that moves within 60 yd of the creature; most scripts have no
+    // line-of-sight event, so do not walk the event list for them
+    if (!me || !mHasLosEvent)
         return;
 
     ProcessEventsFor(me->IsEngaged() ? SMART_EVENT_IC_LOS : SMART_EVENT_OOC_LOS, who);
