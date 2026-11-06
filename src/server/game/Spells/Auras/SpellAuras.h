@@ -157,6 +157,7 @@ public:
 
     bool HasMoreThanOneEffectForType(AuraType auraType) const;
     bool IsArea() const;
+    bool IsOwnerOnlyUnitAura() const; // every effect is SPELL_EFFECT_APPLY_AURA, so the owner is the only target
     bool IsPassive() const;
     bool IsDeathPersistent() const;
     bool IsRemovedOnShapeLost(Unit* target) const;
