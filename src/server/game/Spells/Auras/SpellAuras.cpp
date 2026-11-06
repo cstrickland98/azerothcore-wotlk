@@ -595,6 +595,22 @@ void Aura::UpdateTargetMap(Unit* caster, bool apply)
 
     m_updateTargetMapInterval = UPDATE_TARGET_MAP_INTERVAL;
 
+    // Owner-only unit aura already applied with all of its effects: UnitAura::FillTargetMap yields just
+    // {owner, GetEffectMask()} for SPELL_EFFECT_APPLY_AURA effects, so the generic pass below finds the
+    // owner's application, compares the same masks and only removes it if CanBeAppliedOn fails; nothing
+    // is added. Do exactly that check without building the target map.
+    if (GetType() == UNIT_AURA_TYPE && m_applications.size() == 1 && IsOwnerOnlyUnitAura())
+    {
+        AuraApplication* ownerApp = m_applications.begin()->second;
+        Unit* target = ownerApp->GetTarget();
+        if (target == GetOwner() && ownerApp->GetEffectMask() == GetEffectMask())
+        {
+            if (!CanBeAppliedOn(target))
+                target->_UnapplyAura(ownerApp, AURA_REMOVE_BY_DEFAULT);
+            return;
+        }
+    }
+
     // fill up to date target list
     //       target, effMask
     std::map<Unit*, uint8> targets;
@@ -1131,6 +1147,19 @@ bool Aura::IsArea() const
             return true;
     }
     return false;
+}
+
+bool Aura::IsOwnerOnlyUnitAura() const
+{
+    uint8 const effMask = GetEffectMask();
+    if (!effMask || m_spellInfo->GetSpellSpecific() == SPELL_SPECIFIC_AURA)
+        return false;
+
+    for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+        if ((effMask & (1 << i)) && GetSpellInfo()->Effects[i].Effect != SPELL_EFFECT_APPLY_AURA)
+            return false;
+
+    return true;
 }
 
 bool Aura::IsPassive() const
