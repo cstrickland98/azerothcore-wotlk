@@ -3749,6 +3749,22 @@ uint32 Unit::GetWeaponSkillValue (WeaponAttackType attType, Unit const* target) 
     return value;
 }
 
+void Unit::_AddAuraToUpdateList(Aura* aura)
+{
+    if (std::find(m_auraUpdateList.begin(), m_auraUpdateList.end(), aura) == m_auraUpdateList.end())
+        m_auraUpdateList.push_back(aura);
+}
+
+void Unit::_RemoveAuraFromUpdateList(Aura* aura)
+{
+    auto itr = std::find(m_auraUpdateList.begin(), m_auraUpdateList.end(), aura);
+    if (itr != m_auraUpdateList.end())
+    {
+        *itr = m_auraUpdateList.back();
+        m_auraUpdateList.pop_back();
+    }
+}
+
 void Unit::_DeleteRemovedAuras()
 {
     while (!m_removedAuras.empty())
@@ -3773,31 +3789,50 @@ void Unit::_UpdateSpells(uint32 time)
         }
     }
 
-    // snapshot - UpdateOwner can mutate the map; pointers stay valid (removed auras
+    // Only the auras on the update list can change from tick to tick. A permanent owner-only
+    // aura (talents, passives, equip and set spells: most of a player's auras) leaves the list
+    // the first time UpdateOwner finds it static, and Aura::InvalidateStaticOnOwner puts it back
+    // when any of its inputs change. Such an aura can neither expire nor be channeled, so the
+    // expiry loop below is restricted to the list as well.
+    // snapshot - UpdateOwner can mutate the list; pointers stay valid (removed auras
     // are deleted later in _DeleteRemovedAuras)
-    m_auraUpdateSnapshot.clear();
-    m_auraUpdateSnapshot.reserve(m_ownedAuras.size());
-    for (auto& [id, aura] : m_ownedAuras)
-        m_auraUpdateSnapshot.push_back(aura);
-
+    m_auraUpdateSnapshot.assign(m_auraUpdateList.begin(), m_auraUpdateList.end());
     for (Aura* aura : m_auraUpdateSnapshot)
-        if (!aura->IsRemoved())
-            aura->UpdateOwner(time, this);
-
-    // remove expired auras - do that after updates(used in scripts?)
-    for (AuraMap::iterator i = m_ownedAuras.begin(); i != m_ownedAuras.end();)
     {
-        if (i->second->IsExpired())
-            RemoveOwnedAura(i, AURA_REMOVE_BY_EXPIRE);
-        else if (i->second->GetSpellInfo()->IsChanneled() && i->second->GetCasterGUID() != GetGUID() && !ObjectAccessor::GetWorldObject(*this, i->second->GetCasterGUID()))
-            RemoveOwnedAura(i, AURA_REMOVE_BY_CANCEL); // remove channeled auras when caster is not on the same map
-        else
-            ++i;
+        if (aura->IsRemoved())
+            continue;
+
+        aura->UpdateOwner(time, this);
+
+        if (!aura->IsRemoved() && aura->IsKnownStaticOnOwner())
+            _RemoveAuraFromUpdateList(aura);
     }
 
-    for (VisibleAuraMap::iterator itr = m_visibleAuras.begin(); itr != m_visibleAuras.end(); ++itr)
-        if (itr->second->IsNeedClientUpdate())
-            itr->second->ClientUpdate();
+    // remove expired auras - do that after updates(used in scripts?)
+    for (std::size_t i = 0; i < m_auraUpdateList.size();)
+    {
+        Aura* aura = m_auraUpdateList[i];
+        if (aura->IsExpired())
+            RemoveOwnedAura(aura, AURA_REMOVE_BY_EXPIRE);
+        else if (aura->GetSpellInfo()->IsChanneled() && aura->GetCasterGUID() != GetGUID() && !ObjectAccessor::GetWorldObject(*this, aura->GetCasterGUID()))
+            RemoveOwnedAura(aura, AURA_REMOVE_BY_CANCEL); // remove channeled auras when caster is not on the same map
+        else
+        {
+            ++i;
+            continue;
+        }
+
+        i = 0; // the removal may cascade into other listed auras: rescan, as the iterator restart did
+    }
+
+    // Every writer goes through AuraApplication::SetNeedClientUpdate, which flags the unit
+    if (m_needAuraClientUpdate)
+    {
+        m_needAuraClientUpdate = false;
+        for (VisibleAuraMap::iterator itr = m_visibleAuras.begin(); itr != m_visibleAuras.end(); ++itr)
+            if (itr->second->IsNeedClientUpdate())
+                itr->second->ClientUpdate();
+    }
 
     _DeleteRemovedAuras();
 
@@ -4479,6 +4514,7 @@ void Unit::_AddAura(UnitAura* aura, Unit* caster)
 {
     ASSERT(!m_cleanupDone);
     m_ownedAuras.insert(AuraMap::value_type(aura->GetId(), aura));
+    _AddAuraToUpdateList(aura);
 
     _RemoveNoStackAurasDueToAura(aura, true);
 
@@ -4766,6 +4802,7 @@ void Unit::RemoveOwnedAura(AuraMap::iterator& i, AuraRemoveMode removeMode)
     ASSERT(!aura->IsRemoved());
 
     m_ownedAuras.erase(i);
+    _RemoveAuraFromUpdateList(aura);
     m_removedAuras.push_back(aura);
 
     // Unregister single target aura

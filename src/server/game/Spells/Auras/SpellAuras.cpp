@@ -1181,7 +1181,9 @@ bool Aura::IsOwnerOnlyUnitAura() const
 
 bool Aura::IsStaticOnOwner() const
 {
-    if (m_duration >= 0 || GetType() != UNIT_AURA_TYPE || m_applications.size() != 1 || !m_removedApplications.empty())
+    // Permanent and not channeled: a static aura can neither expire nor lose its channeling caster,
+    // so Unit::_UpdateSpells only checks the auras on its update list for either
+    if (m_duration >= 0 || m_spellInfo->IsChanneled() || GetType() != UNIT_AURA_TYPE || m_applications.size() != 1 || !m_removedApplications.empty())
         return false;
 
     for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
@@ -1194,6 +1196,16 @@ bool Aura::IsStaticOnOwner() const
 
     AuraApplication const* ownerApp = m_applications.begin()->second;
     return ownerApp->GetTarget() == GetOwner() && ownerApp->GetEffectMask() == GetEffectMask() && IsOwnerOnlyUnitAura();
+}
+
+void Aura::InvalidateStaticOnOwner()
+{
+    // An aura found static left its owner's per-tick update list; put it back so the next
+    // tick re-evaluates it. A removed aura stays off the list.
+    if (m_staticOnOwner == 1 && !m_isRemoved)
+        GetUnitOwner()->_AddAuraToUpdateList(this);
+
+    m_staticOnOwner = -1;
 }
 
 bool Aura::IsPassive() const

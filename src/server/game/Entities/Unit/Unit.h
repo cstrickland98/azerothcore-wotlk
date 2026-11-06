@@ -1389,6 +1389,9 @@ public:
     // m_ownedAuras container management
     AuraMap&       GetOwnedAuras()       { return m_ownedAuras; }
     [[nodiscard]] AuraMap const& GetOwnedAuras() const { return m_ownedAuras; }
+    void _AddAuraToUpdateList(Aura* aura);
+    void _RemoveAuraFromUpdateList(Aura* aura);
+    void SetNeedAuraClientUpdate() { m_needAuraClientUpdate = true; }
 
     void RemoveOwnedAura(AuraMap::iterator& i, AuraRemoveMode removeMode = AURA_REMOVE_BY_DEFAULT);
     void RemoveOwnedAura(uint32 spellId, ObjectGuid casterGUID = ObjectGuid::Empty, uint8 reqEffMask = 0, AuraRemoveMode removeMode = AURA_REMOVE_BY_DEFAULT);
@@ -2190,6 +2193,8 @@ protected:
     AuraApplicationMap m_appliedAuras;
     AuraList m_removedAuras;
     std::vector<Aura*> m_auraUpdateSnapshot; // _UpdateSpells scratch buffer
+    std::vector<Aura*> m_auraUpdateList;     // owned auras not known to be static on the owner, see _UpdateSpells
+    bool m_needAuraClientUpdate = false;     // an AuraApplication of this unit has a client update pending
     uint32 m_removedAurasCount;
 
     AuraEffectList m_modAuras[TOTAL_AURAS];
