@@ -596,9 +596,16 @@ void AuraEffect::CalculatePeriodicData()
         SetCritChance(CalcPeriodicCritChance(GetCaster(), (GetBase()->GetType() == UNIT_AURA_TYPE ? GetBase()->GetUnitOwner() : nullptr)));
 }
 
+void AuraEffect::SetPeriodic(bool isPeriodic)
+{
+    m_isPeriodic = isPeriodic;
+    GetBase()->InvalidateStaticOnOwner();
+}
+
 void AuraEffect::CalculatePeriodic(Unit* caster, bool create, bool load)
 {
     m_amplitude = m_spellInfo->Effects[m_effIndex].Amplitude;
+    GetBase()->InvalidateStaticOnOwner(); // m_isPeriodic is decided below
 
     // prepare periodics
     switch (GetAuraType())
@@ -988,6 +995,7 @@ void AuraEffect::UpdatePeriodic(Unit* caster)
                                 if (aurEff->GetAuraType() != SPELL_AURA_MOD_POWER_REGEN)
                                 {
                                     m_isPeriodic = false;
+                                    GetBase()->InvalidateStaticOnOwner();
                                     LOG_ERROR("spells.aura.effect", "Aura {} structure has been changed - first aura is no longer SPELL_AURA_MOD_POWER_REGEN", GetId());
                                 }
                                 else
@@ -997,6 +1005,7 @@ void AuraEffect::UpdatePeriodic(Unit* caster)
                                     {
                                         aurEff->ChangeAmount(GetAmount());
                                         m_isPeriodic = false;
+                                        GetBase()->InvalidateStaticOnOwner();
                                     }
                                     else
                                     {
@@ -1024,6 +1033,7 @@ void AuraEffect::UpdatePeriodic(Unit* caster)
                                                 aurEff->ChangeAmount(GetAmount());
                                                 // No need to update after 4th tick
                                                 m_isPeriodic = false;
+                                                GetBase()->InvalidateStaticOnOwner();
                                                 break;
                                         }
                                     }

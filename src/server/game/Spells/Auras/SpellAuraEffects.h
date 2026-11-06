@@ -90,7 +90,7 @@ public:
     void ResetTicks() { m_tickNumber = 0; }
 
     bool IsPeriodic() const { return m_isPeriodic; }
-    void SetPeriodic(bool isPeriodic) { m_isPeriodic = isPeriodic; }
+    void SetPeriodic(bool isPeriodic);
     bool IsAffectedOnSpell(SpellInfo const* spell) const;
     bool HasSpellClassMask() const;
 
