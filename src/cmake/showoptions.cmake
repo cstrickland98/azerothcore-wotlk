@@ -205,6 +205,28 @@ if(TSAN)
     add_definitions(-DTSAN -DNO_BUFFERPOOL)
 endif()
 
+# Reports writes to objects owned by another thread of a map updated by several threads (MapUpdate.ThreadsPerMap > 1),
+# see src/server/game/Maps/MapThreading.h. ON, OFF, or DEBUG (default): on for the Debug configuration only, per
+# configuration in multi-config generators.
+set(MAP_THREAD_CHECKS "DEBUG" CACHE STRING "Report cross-thread writes on maps updated by several threads: ON, OFF or DEBUG (Debug configuration only)")
+set_property(CACHE MAP_THREAD_CHECKS PROPERTY STRINGS ON OFF DEBUG)
+string(TOUPPER "${MAP_THREAD_CHECKS}" MAP_THREAD_CHECKS_MODE)
+if(MAP_THREAD_CHECKS_MODE STREQUAL "DEBUG")
+  message("")
+  message(" *** MAP_THREAD_CHECKS - INFO!")
+  message(" *** Cross-thread map writes are reported in the Debug configuration only")
+  target_compile_definitions(acore-compile-option-interface
+    INTERFACE
+      $<$<CONFIG:Debug>:ACORE_MAP_THREAD_CHECKS>)
+elseif(MAP_THREAD_CHECKS)
+  message("")
+  message(" *** MAP_THREAD_CHECKS - WARNING!")
+  message(" *** Cross-thread map writes are checked and reported in every configuration (costs a little per write)")
+  target_compile_definitions(acore-compile-option-interface
+    INTERFACE
+      ACORE_MAP_THREAD_CHECKS)
+endif()
+
 if(BUILD_SHARED_LIBS)
   message("")
   message(" *** WITH_DYNAMIC_LINKING - INFO!")
