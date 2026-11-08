@@ -110,6 +110,37 @@ void ObjectVisibilityContainer::UnlinkVisiblePlayer(Player* player)
     player->GetObjectVisibilityContainer().DirectRemoveVisibilityReference(_selfObject->GetGUID());
 }
 
+void ObjectVisibilityContainer::SnapshotVisiblePlayers(std::vector<Player*>& out) const
+{
+    std::lock_guard<Acore::SpinLock> guard(_lock);
+    std::size_t const count = _visiblePlayersMap.size();
+    ASSERT(count < 1000000, "ObjectVisibilityContainer: {} visible players on {}", count, _selfObject->GetGUID().ToString());
+    out.reserve(count);
+    for (auto const& kvPair : _visiblePlayersMap)
+    {
+        if (out.size() >= count)
+            ABORT("ObjectVisibilityContainer: the visible players of {} (in world: {}) iterate past their size {}", _selfObject->GetGUID().ToString(), _selfObject->IsInWorld(), count);
+        out.push_back(kvPair.second);
+    }
+}
+
+void ObjectVisibilityContainer::SnapshotVisibleWorldObjects(std::vector<WorldObject*>& out) const
+{
+    std::lock_guard<Acore::SpinLock> guard(_lock);
+    if (!_visibleWorldObjectsMap)
+        return;
+
+    std::size_t const count = _visibleWorldObjectsMap->size();
+    ASSERT(count < 1000000, "ObjectVisibilityContainer: {} visible objects on {}", count, _selfObject->GetGUID().ToString());
+    out.reserve(count);
+    for (auto const& kvPair : *_visibleWorldObjectsMap)
+    {
+        if (out.size() >= count)
+            ABORT("ObjectVisibilityContainer: the visible objects of {} (in world: {}) iterate past their size {}", _selfObject->GetGUID().ToString(), _selfObject->IsInWorld(), count);
+        out.push_back(kvPair.second);
+    }
+}
+
 bool ObjectVisibilityContainer::HasVisiblePlayers() const
 {
     std::lock_guard<Acore::SpinLock> guard(_lock);

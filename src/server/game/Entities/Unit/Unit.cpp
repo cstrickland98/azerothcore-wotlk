@@ -13059,7 +13059,9 @@ void Unit::TriggerAurasProcOnEvent(std::list<AuraApplication*>* myProcAuras, std
     // needed for example for Cobra Strikes, pet does the attack, but aura is on owner
     if (Player* modOwner = GetSpellModOwner())
     {
-        if (modOwner != this && spell)
+        // an owner another map task owns right now cannot have its auras procced (and possibly removed) from here
+        Map* map = FindMap();
+        if (modOwner != this && spell && (!map || map->CanWriteNow(modOwner)))
         {
             std::list<AuraApplication*> modAuras;
             for (auto itr = modOwner->GetAppliedAuras().begin(); itr != modOwner->GetAppliedAuras().end(); ++itr)
@@ -16379,7 +16381,20 @@ void Unit::NearTeleportTo(float x, float y, float z, float orientation, bool cas
         Position pos = {x, y, z, orientation};
         SendTeleportPacket(pos);
         UpdatePosition(x, y, z, orientation, true);
-        UpdateObjectVisibility();
+        // During a parallel phase the grid move waits for the serial step, so this task still owns the unit, but the
+        // creatures around the new position may belong to another task: let the serial step notify them
+        Map* map = FindMap();
+        if (map && map->IsParallelPhase() && !MapThreading::IsPositionWritable(x, y))
+        {
+            map->DeferToPhaseEnd([map, guid = GetGUID()]()
+            {
+                WorldObject* obj = map->FindObjectForDeferredOp(guid);
+                if (Unit* unit = obj ? obj->ToUnit() : nullptr; unit && unit->IsInWorld())
+                    unit->UpdateObjectVisibility();
+            });
+        }
+        else
+            UpdateObjectVisibility();
         GetMotionMaster()->ReinitializeMovement();
     }
 }
