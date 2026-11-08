@@ -110,8 +110,24 @@ struct npc_pet_mage_mirror_image : CasterAI
         //owner->CastSpell((Unit*)nullptr, SPELL_MAGE_MASTERS_THREAT_LIST, true);
         for (auto const& pair : owner->GetThreatMgr().GetThreatenedByMeList())
         {
-            if (Unit* unit = pair.second->GetOwner())
+            // A threatening unit in another grid task's area (parallel map update) adds the threat in the serial
+            // step after the phase
+            Unit* unit = pair.second->GetOwner();
+            if (!unit)
+                continue;
+
+            if (me->GetMap()->CanWriteNow(unit))
                 unit->GetThreatMgr().AddThreat(me, pair.second->GetThreat());
+            else
+            {
+                me->GetMap()->RunOnOwner(unit, [imageGuid = me->GetGUID(), threat = pair.second->GetThreat()](WorldObject* target)
+                {
+                    Unit* threatener = target->ToUnit();
+                    Unit* image = ObjectAccessor::GetUnit(*target, imageGuid);
+                    if (threatener && image && image->IsInWorld())
+                        threatener->GetThreatMgr().AddThreat(image, threat);
+                });
+            }
         }
 
         _ebonGargoyleGUID.Clear();
@@ -162,16 +178,22 @@ struct npc_pet_mage_mirror_image : CasterAI
         if (_ebonGargoyleGUID)
         {
             Unit* gargoyle = ObjectAccessor::GetUnit(*me, _ebonGargoyleGUID);
-            if (gargoyle && gargoyle->GetAI())
-                gargoyle->GetAI()->AttackStart(me);
-            _ebonGargoyleGUID.Clear();
+            // A gargoyle in another grid task's area (parallel map update) is told on a later update
+            if (!gargoyle || me->GetMap()->CanWriteNow(gargoyle))
+            {
+                if (gargoyle && gargoyle->GetAI())
+                    gargoyle->GetAI()->AttackStart(me);
+                _ebonGargoyleGUID.Clear();
+            }
         }
         Unit* owner = me->GetOwner();
         if (owner && owner->IsPlayer())
         {
             Unit* selection = owner->ToPlayer()->GetSelectedUnit();
 
-            if (selection && me->CanSeeOrDetect(selection))
+            // Threat and attack link the target both ways; a target in another grid task's area (parallel map
+            // update, the owner's selection can be far) is skipped and evaluated again on the next update
+            if (selection && me->GetMap()->CanWriteNow(selection) && me->CanSeeOrDetect(selection))
             {
                 me->GetThreatMgr().ResetAllThreat();
                 me->AddThreat(selection, 1000000.0f);
