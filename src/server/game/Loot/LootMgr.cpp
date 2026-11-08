@@ -504,6 +504,7 @@ void Loot::AddItem(LootStoreItem const& item)
         {
             if (auto group = player->GetGroup())
             {
+                std::lock_guard<std::recursive_mutex> guard(group->GetLock());
                 for (auto itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
                 {
                     if (auto member = itr->GetSource())
@@ -568,6 +569,7 @@ bool Loot::FillLoot(uint32 lootId, LootStore const& store, Player* lootOwner, bo
     {
         roundRobinPlayer = lootOwner->GetGUID();
 
+        std::lock_guard<std::recursive_mutex> guard(group->GetLock());
         for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
         {
             if (Player* player = itr->GetSource()) // should actually be looted object instead of lootOwner but looter has to be really close so doesnt really matter

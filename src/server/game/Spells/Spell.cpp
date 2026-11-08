@@ -6111,6 +6111,8 @@ SpellCastResult Spell::CheckCast(bool strict, uint32* /*param1*/, uint32* /*para
                 if (instanceScript->IsEncounterInProgress())
                 {
                     if (Group* group = unitCaster->ToPlayer()->GetGroup())
+                    {
+                        std::lock_guard<std::recursive_mutex> guard(group->GetLock());
                         for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
                             if (Player* member = itr->GetSource())
                                 if (member->IsInMap(unitCaster))
@@ -6120,6 +6122,7 @@ SpellCastResult Spell::CheckCast(bool strict, uint32* /*param1*/, uint32* /*para
                                             unitCaster->EngageWithTarget(victim);
                                             break;
                                         }
+                    }
                     return SPELL_FAILED_TARGET_CANNOT_BE_RESURRECTED;
                 }
     }

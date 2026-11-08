@@ -13040,6 +13040,7 @@ bool Player::GetsRecruitAFriendBonus(bool forXP)
     {
         if (Group* group = this->GetGroup())
         {
+            std::lock_guard<std::recursive_mutex> guard(group->GetLock());
             for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
             {
                 Player* player = itr->GetSource();
@@ -13091,6 +13092,7 @@ void Player::RewardPlayerAndGroupAtEvent(uint32 creature_id, WorldObject* pRewar
     // prepare data for near group iteration
     if (Group* group = GetGroup())
     {
+        std::lock_guard<std::recursive_mutex> guard(group->GetLock());
         for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
         {
             Player* player = itr->GetSource();
@@ -13102,7 +13104,18 @@ void Player::RewardPlayerAndGroupAtEvent(uint32 creature_id, WorldObject* pRewar
 
             // quest objectives updated only for alive group member or dead but with not released body
             if (player->IsAlive() || !player->GetCorpse())
-                player->KilledMonsterCredit(creature_id, creature_guid);
+            {
+                // in a parallel map phase a member may be outside this task's area: credit it on its owner
+                if (player->GetMap()->CanWriteNow(player))
+                    player->KilledMonsterCredit(creature_id, creature_guid);
+                else
+                    player->GetMap()->RunOnOwner(player, [creature_id, creature_guid](WorldObject* target)
+                    {
+                        if (Player* member = target->ToPlayer())
+                            if (member->IsInWorld())
+                                member->KilledMonsterCredit(creature_id, creature_guid);
+                    });
+            }
         }
     }
     else                                                    // if (!group)
@@ -13348,6 +13361,7 @@ Player* Player::GetNextRandomRaidMember(float radius)
         return nullptr;
 
     std::vector<Player*> nearMembers;
+    std::lock_guard<std::recursive_mutex> guard(group->GetLock());
     nearMembers.reserve(group->GetMembersCount());
 
     for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
@@ -13393,9 +13407,12 @@ PartyResult Player::CanUninviteFromGroup(ObjectGuid targetPlayerGUID) const
             return ERR_PARTY_LFG_BOOT_LOOT_ROLLS;
 
         /// @todo: Should also be sent when anyone has recently left combat, with an aprox ~5 seconds timer.
-        for (GroupReference const* itr = grp->GetFirstMember(); itr != nullptr; itr = itr->next())
-            if (itr->GetSource() && itr->GetSource()->IsInMap(this) && itr->GetSource()->IsInCombat())
-                return ERR_PARTY_LFG_BOOT_IN_COMBAT;
+        {
+            std::lock_guard<std::recursive_mutex> guard(grp->GetLock());
+            for (GroupReference const* itr = grp->GetFirstMember(); itr != nullptr; itr = itr->next())
+                if (itr->GetSource() && itr->GetSource()->IsInMap(this) && itr->GetSource()->IsInCombat())
+                    return ERR_PARTY_LFG_BOOT_IN_COMBAT;
+        }
 
         if (Player* target = ObjectAccessor::FindConnectedPlayer(targetPlayerGUID))
         {
