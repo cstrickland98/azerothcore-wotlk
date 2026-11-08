@@ -1278,17 +1278,43 @@ void Player::UpdateZone(uint32 newZone, uint32 newArea, bool force)
     if (!newZone)
         return;
 
-    if (m_zoneUpdateId != newZone || force)
+    // The outdoor PvP, world state and battlefield managers keep zone-wide player sets shared by every grid: in a
+    // parallel map phase their hooks run in the serial step after it, for the player still on this map
+    bool const zoneHooks = m_zoneUpdateId != newZone || force;
+    bool const battlefieldHooks = m_zoneUpdateId != newZone;
+    auto runZoneHooks = [zoneHooks, battlefieldHooks, oldZone = m_zoneUpdateId, newZone](Player* player)
     {
-        sOutdoorPvPMgr->HandlePlayerLeaveZone(this, m_zoneUpdateId);
-        sOutdoorPvPMgr->HandlePlayerEnterZone(this, newZone);
-        sWorldState->HandlePlayerLeaveZone(this, static_cast<AreaTableIDs>(m_zoneUpdateId));
-        sWorldState->HandlePlayerEnterZone(this, static_cast<AreaTableIDs>(newZone));
+        if (zoneHooks)
+        {
+            sOutdoorPvPMgr->HandlePlayerLeaveZone(player, oldZone);
+            sOutdoorPvPMgr->HandlePlayerEnterZone(player, newZone);
+            sWorldState->HandlePlayerLeaveZone(player, static_cast<AreaTableIDs>(oldZone));
+            sWorldState->HandlePlayerEnterZone(player, static_cast<AreaTableIDs>(newZone));
+        }
+        if (battlefieldHooks)
+        {
+            sBattlefieldMgr->HandlePlayerLeaveZone(player, oldZone);
+            sBattlefieldMgr->HandlePlayerEnterZone(player, newZone);
+        }
+    };
+
+    Map* zoneMap = FindMap();
+    if ((zoneHooks || battlefieldHooks) && zoneMap && zoneMap->IsParallelPhase())
+    {
+        zoneMap->DeferToPhaseEnd([runZoneHooks, zoneMap, playerGuid = GetGUID()]()
+        {
+            Player* player = ObjectAccessor::FindPlayer(playerGuid);
+            if (!player || player->FindMap() != zoneMap)
+                return;
+
+            runZoneHooks(player);
+        });
     }
+    else
+        runZoneHooks(this);
+
     if (m_zoneUpdateId != newZone)
     {
-        sBattlefieldMgr->HandlePlayerLeaveZone(this, m_zoneUpdateId);
-        sBattlefieldMgr->HandlePlayerEnterZone(this, newZone);
         SendInitWorldStates(newZone,
                             newArea); // only if really enters to new zone, not
                                       // just area change, works strange...
