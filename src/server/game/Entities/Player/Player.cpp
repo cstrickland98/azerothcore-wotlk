@@ -13558,6 +13558,22 @@ void Player::SetViewpoint(WorldObject* target, bool apply)
     }
 }
 
+void Player::SetViewpoint(ObjectGuid target, bool apply)
+{
+    if (WorldObject* viewpoint = ObjectAccessor::GetWorldObject(*this, target))
+    {
+        SetViewpoint(viewpoint, apply);
+        return;
+    }
+
+    if (apply)
+        return;
+
+    m_seer = this;
+    RemoveGuidValue(PLAYER_FARSIGHT, target);
+    SetSeer(this);
+}
+
 WorldObject* Player::GetViewpoint() const
 {
     if (ObjectGuid guid = GetGuidValue(PLAYER_FARSIGHT))

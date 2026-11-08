@@ -2631,49 +2631,8 @@ void Unit::CalcAbsorbResist(DamageInfo& dmgInfo, bool Splited, uint8 casterLevel
 
             dmgInfo.AbsorbDamage(splitDamage);
 
-            uint32 splitted = splitDamage;
-            uint32 splitted_absorb = 0;
-            uint32 splitted_resist = 0;
-
-            uint32 procAttacker = 0, procVictim = 0;
-            DamageInfo splittedDmgInfo(attacker, caster, splitted, spellInfo, schoolMask, dmgInfo.GetDamageType());
-            splittedDmgInfo.AddHitMask(PROC_HIT_NORMAL);
-            if (caster->IsImmunedToDamageOrSchool(schoolMask))
-            {
-                splittedDmgInfo.AddHitMask(PROC_HIT_IMMUNE);
-                splittedDmgInfo.AbsorbDamage(splitted);
-            }
-            else
-            {
-                Unit::CalcAbsorbResist(splittedDmgInfo, true, casterLevel);
-                Unit::DealDamageMods(caster, splitted, &splitted_absorb);
-            }
-
-            splitted_absorb = splittedDmgInfo.GetAbsorb();
-            splitted_resist = splittedDmgInfo.GetResist();
-            splitted = splittedDmgInfo.GetDamage();
-
-            // Add absorb to hitMask if damage was absorbed
-            if (splittedDmgInfo.GetAbsorb())
-                splittedDmgInfo.AddHitMask(PROC_HIT_ABSORB);
-
-            // create procs
-            createProcFlags(spellInfo, BASE_ATTACK, false, procAttacker, procVictim);
-            caster->ProcSkillsAndReactives(true, attacker, procVictim, splittedDmgInfo.GetHitMask(), BASE_ATTACK, spellInfo, splitted, nullptr, -1, nullptr, &splittedDmgInfo);
-
-            if (attacker)
-            {
-                attacker->SendSpellNonMeleeDamageLog(caster, splitSpellInfo, splitted, schoolMask, splitted_absorb, splitted_resist, false, 0, false, true);
-            }
-
-            CleanDamage cleanDamage = CleanDamage(splitted, 0, BASE_ATTACK, MELEE_HIT_NORMAL);
-
-            // Split damage is a hostile interaction for its recipient too.
-            if (splitDamage && attacker && !attacker->IsFriendlyTo(caster) && !skipCombat)
-                attacker->AtTargetAttacked(caster, !spellInfo || spellInfo->HasInitialAggro());
-
-            Unit::DealDamage(attacker, caster, splitted, &cleanDamage, DIRECT_DAMAGE, schoolMask, splitSpellInfo,
-                false, false, nullptr, skipCombat);
+            DealSplitDamage(attacker, caster, splitDamage, spellInfo, splitSpellInfo, schoolMask, schoolMask,
+                dmgInfo.GetDamageType(), casterLevel, skipCombat, true);
         }
 
         // We're going to call functions which can modify content of the list during iteration over it's elements
@@ -2710,51 +2669,83 @@ void Unit::CalcAbsorbResist(DamageInfo& dmgInfo, bool Splited, uint8 casterLevel
             else
                 splitSchoolMask = SPELL_SCHOOL_MASK_NATURE;
 
-            uint32 splitted = splitDamage;
-            uint32 splitted_absorb = 0;
-            uint32 splitted_resist = 0;
-
-            uint32 procAttacker = 0, procVictim = 0;
-            DamageInfo splittedDmgInfo(attacker, caster, splitted, spellInfo, splitSchoolMask, dmgInfo.GetDamageType());
-            splittedDmgInfo.AddHitMask(PROC_HIT_NORMAL);
-            if (caster->IsImmunedToDamageOrSchool(schoolMask))
-            {
-                splittedDmgInfo.AddHitMask(PROC_HIT_IMMUNE);
-                splittedDmgInfo.AbsorbDamage(splitted);
-            }
-            else
-            {
-                Unit::CalcAbsorbResist(splittedDmgInfo, true, casterLevel);
-                Unit::DealDamageMods(caster, splitted, &splitted_absorb);
-            }
-
-            splitted_absorb = splittedDmgInfo.GetAbsorb();
-            splitted_resist = splittedDmgInfo.GetResist();
-            splitted = splittedDmgInfo.GetDamage();
-
-            // Add absorb to hitMask if damage was absorbed
-            if (splittedDmgInfo.GetAbsorb())
-                splittedDmgInfo.AddHitMask(PROC_HIT_ABSORB);
-
-            // create procs
-            createProcFlags(spellInfo, BASE_ATTACK, false, procAttacker, procVictim);
-            caster->ProcSkillsAndReactives(true, attacker, procVictim, splittedDmgInfo.GetHitMask(), BASE_ATTACK, spellInfo, splitted);
-
-            if (attacker)
-            {
-                attacker->SendSpellNonMeleeDamageLog(caster, splitSpellInfo, splitted, splitSchoolMask, splitted_absorb, splitted_resist, false, 0, false, true);
-            }
-
-            CleanDamage cleanDamage = CleanDamage(splitted, 0, BASE_ATTACK, MELEE_HIT_NORMAL);
-
-            // Split damage is a hostile interaction for its recipient too.
-            if (splitDamage && attacker && !attacker->IsFriendlyTo(caster) && !skipCombat)
-                attacker->AtTargetAttacked(caster, !spellInfo || spellInfo->HasInitialAggro());
-
-            Unit::DealDamage(attacker, caster, splitted, &cleanDamage, DIRECT_DAMAGE, splitSchoolMask, splitSpellInfo,
-                false, false, nullptr, skipCombat);
+            DealSplitDamage(attacker, caster, splitDamage, spellInfo, splitSpellInfo, schoolMask, splitSchoolMask,
+                dmgInfo.GetDamageType(), casterLevel, skipCombat, false);
         }
     }
+}
+
+void Unit::DealSplitDamage(Unit* attacker, Unit* caster, uint32 splitDamage, SpellInfo const* spellInfo,
+    SpellInfo const* splitSpellInfo, SpellSchoolMask schoolMask, SpellSchoolMask splitSchoolMask,
+    DamageEffectType damageType, uint8 casterLevel, bool skipCombat, bool procWithDamageInfo)
+{
+    // the split aura's caster can be far from the victim, in another task's area: its share is dealt on its owner
+    if (Map* map = caster->FindMap(); map && !map->CanWriteNow(caster))
+    {
+        map->RunOnOwner(caster, [attackerGuid = attacker ? attacker->GetGUID() : ObjectGuid::Empty, splitDamage,
+            spellInfo, splitSpellInfo, schoolMask, splitSchoolMask, damageType, casterLevel, skipCombat,
+            procWithDamageInfo](WorldObject* target)
+        {
+            Unit* deferredCaster = target->ToUnit();
+            if (!deferredCaster || !deferredCaster->IsInWorld() || !deferredCaster->IsAlive())
+                return;
+
+            Unit* deferredAttacker = attackerGuid ? ObjectAccessor::GetUnit(*target, attackerGuid) : nullptr;
+            DealSplitDamage(deferredAttacker, deferredCaster, splitDamage, spellInfo, splitSpellInfo, schoolMask,
+                splitSchoolMask, damageType, casterLevel, skipCombat, procWithDamageInfo);
+        });
+        return;
+    }
+
+    uint32 splitted = splitDamage;
+    uint32 splitted_absorb = 0;
+    uint32 splitted_resist = 0;
+
+    uint32 procAttacker = 0, procVictim = 0;
+    DamageInfo splittedDmgInfo(attacker, caster, splitted, spellInfo, splitSchoolMask, damageType);
+    splittedDmgInfo.AddHitMask(PROC_HIT_NORMAL);
+    if (caster->IsImmunedToDamageOrSchool(schoolMask))
+    {
+        splittedDmgInfo.AddHitMask(PROC_HIT_IMMUNE);
+        splittedDmgInfo.AbsorbDamage(splitted);
+    }
+    else
+    {
+        Unit::CalcAbsorbResist(splittedDmgInfo, true, casterLevel);
+        Unit::DealDamageMods(caster, splitted, &splitted_absorb);
+    }
+
+    splitted_absorb = splittedDmgInfo.GetAbsorb();
+    splitted_resist = splittedDmgInfo.GetResist();
+    splitted = splittedDmgInfo.GetDamage();
+
+    // Add absorb to hitMask if damage was absorbed
+    if (splittedDmgInfo.GetAbsorb())
+        splittedDmgInfo.AddHitMask(PROC_HIT_ABSORB);
+
+    // create procs
+    createProcFlags(spellInfo, BASE_ATTACK, false, procAttacker, procVictim);
+    if (procWithDamageInfo)
+        caster->ProcSkillsAndReactives(true, attacker, procVictim, splittedDmgInfo.GetHitMask(), BASE_ATTACK, spellInfo,
+            splitted, nullptr, -1, nullptr, &splittedDmgInfo);
+    else
+        caster->ProcSkillsAndReactives(true, attacker, procVictim, splittedDmgInfo.GetHitMask(), BASE_ATTACK, spellInfo,
+            splitted);
+
+    if (attacker)
+    {
+        attacker->SendSpellNonMeleeDamageLog(caster, splitSpellInfo, splitted, splitSchoolMask, splitted_absorb,
+            splitted_resist, false, 0, false, true);
+    }
+
+    CleanDamage cleanDamage = CleanDamage(splitted, 0, BASE_ATTACK, MELEE_HIT_NORMAL);
+
+    // Split damage is a hostile interaction for its recipient too.
+    if (splitDamage && attacker && !attacker->IsFriendlyTo(caster) && !skipCombat)
+        attacker->AtTargetAttacked(caster, !spellInfo || spellInfo->HasInitialAggro());
+
+    Unit::DealDamage(attacker, caster, splitted, &cleanDamage, DIRECT_DAMAGE, splitSchoolMask, splitSpellInfo,
+        false, false, nullptr, skipCombat);
 }
 
 void Unit::CalcHealAbsorb(HealInfo& healInfo)
@@ -14877,7 +14868,43 @@ void Unit::RemoveCharmedBy(Unit* charmer)
     if (type != CHARM_TYPE_VEHICLE)
         LastCharmerGUID = charmer->GetGUID();
 
-    charmer->SetCharm(this, false);
+    // The charm aura ends on the charmed unit's thread, the charmer can be far, in another task's area: the charmer's
+    // half (charm link, client control, control bar) runs on the charmer's owner; until then this unit stays linked,
+    // so a removal from the world in between still ends the charm in full.
+    Map* charmMap = GetMap();
+    bool const farCharmer = !charmMap->CanWriteNow(charmer);
+    if (farCharmer)
+        charmMap->RunOnOwner(charmer, [charmGuid = GetGUID(), type](WorldObject* target)
+        {
+            Unit* deferredCharmer = target->ToUnit();
+            if (!deferredCharmer)
+                return;
+
+            Unit* charm = ObjectAccessor::GetUnit(*target, charmGuid);
+            if (!charm || charm->GetCharmerGUID() != deferredCharmer->GetGUID())
+            {
+                // the charm already ended in full (removal from the world) or the unit is gone
+                if (Player* playerCharmer = deferredCharmer->ToPlayer())
+                    playerCharmer->RemoveGuidValue(UNIT_FIELD_CHARM, charmGuid);
+                return;
+            }
+
+            deferredCharmer->SetCharm(charm, false);
+            if (Player* playerCharmer = deferredCharmer->ToPlayer())
+            {
+                if (type == CHARM_TYPE_VEHICLE || type == CHARM_TYPE_POSSESS)
+                {
+                    playerCharmer->SetClientControl(charm, false);
+                    playerCharmer->SetClientControl(deferredCharmer, true); // verified
+                }
+                if (type == CHARM_TYPE_POSSESS)
+                    deferredCharmer->RemoveUnitFlag(UNIT_FLAG_DISABLE_MOVE);
+                if (charm != deferredCharmer->GetFirstControlled())
+                    playerCharmer->SendRemoveControlBar();
+            }
+        });
+    else
+        charmer->SetCharm(this, false);
 
     StopAttackingInvalidTarget();
 
@@ -14890,15 +14917,21 @@ void Unit::RemoveCharmedBy(Unit* charmer)
         switch (type)
         {
             case CHARM_TYPE_VEHICLE:
-                playerCharmer->SetClientControl(this, false);
-                playerCharmer->SetClientControl(charmer, true); // verified
+                if (!farCharmer)
+                {
+                    playerCharmer->SetClientControl(this, false);
+                    playerCharmer->SetClientControl(charmer, true); // verified
+                }
                 RemoveUnitFlag(UNIT_FLAG_POSSESSED);
                 ClearUnitState(UNIT_STATE_NO_ENVIRONMENT_UPD);
                 break;
             case CHARM_TYPE_POSSESS:
-                playerCharmer->SetClientControl(this, false);
-                playerCharmer->SetClientControl(charmer, true); // verified
-                charmer->RemoveUnitFlag(UNIT_FLAG_DISABLE_MOVE);
+                if (!farCharmer)
+                {
+                    playerCharmer->SetClientControl(this, false);
+                    playerCharmer->SetClientControl(charmer, true); // verified
+                    charmer->RemoveUnitFlag(UNIT_FLAG_DISABLE_MOVE);
+                }
                 RemoveUnitFlag(UNIT_FLAG_POSSESSED);
                 ClearUnitState(UNIT_STATE_POSSESSED);
                 ClearUnitState(UNIT_STATE_NO_ENVIRONMENT_UPD);
@@ -14963,7 +14996,7 @@ void Unit::RemoveCharmedBy(Unit* charmer)
     }
 
     // a guardian should always have charminfo
-    if (playerCharmer && this != charmer->GetFirstControlled())
+    if (playerCharmer && !farCharmer && this != charmer->GetFirstControlled())
         playerCharmer->SendRemoveControlBar();
 
     // xinef: Always delete charm info (restores react state)

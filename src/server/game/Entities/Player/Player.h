@@ -2398,6 +2398,9 @@ public:
     void SetSeer(WorldObject* target) { m_seer = target; }
     WorldObject* GetSeer() const { return m_seer; }
     void SetViewpoint(WorldObject* target, bool apply);
+    // For callers that hold only the viewpoint's GUID (deferred cross-thread calls); a viewpoint that left the world
+    // is still cleared on remove
+    void SetViewpoint(ObjectGuid target, bool apply);
     [[nodiscard]] WorldObject* GetViewpoint() const;
     Position const& GetSightPosition() const;
     void StopCastingCharm(Aura* except = nullptr);

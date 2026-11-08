@@ -1594,6 +1594,10 @@ public:
     bool CanProc() { return !m_procDeep; }
     void SetCantProc(bool apply);
 
+    // The split aura caster's share of a split-damage aura: absorb / resist, procs, log and damage on the caster
+    static void DealSplitDamage(Unit* attacker, Unit* caster, uint32 splitDamage, SpellInfo const* spellInfo,
+        SpellInfo const* splitSpellInfo, SpellSchoolMask schoolMask, SpellSchoolMask splitSchoolMask,
+        DamageEffectType damageType, uint8 casterLevel, bool skipCombat, bool procWithDamageInfo);
     static void ProcSkillsAndAuras(Unit* actor, Unit* victim, uint32 procAttacker, uint32 procVictim, uint32 procEx, uint32 amount, WeaponAttackType attType = BASE_ATTACK, SpellInfo const* procSpellInfo = nullptr, SpellInfo const* procAura = nullptr, int8 procAuraEffectIndex = -1, Spell const* procSpell = nullptr, DamageInfo* damageInfo = nullptr, HealInfo* healInfo = nullptr, uint32 procPhase = 2 /*PROC_SPELL_PHASE_HIT*/);
     void ProcSkillsAndReactives(bool isVictim, Unit* target, uint32 procFlag, uint32 procExtra, WeaponAttackType attType, SpellInfo const* procSpellInfo, uint32 damage, SpellInfo const* procAura = nullptr, int8 procAuraEffectIndex = -1, Spell const* procSpell = nullptr, DamageInfo* damageInfo = nullptr, HealInfo* healInfo = nullptr, uint32 procPhase = 2 /*PROC_SPELL_PHASE_HIT*/);
 
