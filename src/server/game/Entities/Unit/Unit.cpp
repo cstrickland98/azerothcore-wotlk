@@ -55,6 +55,7 @@
 #include "PetAI.h"
 #include "PetPackets.h"
 #include "Player.h"
+#include <optional>
 #include "ReputationMgr.h"
 #include "ScriptMgr.h"
 #include "SharedDefines.h"
@@ -1469,6 +1470,41 @@ SpellCastResult Unit::CastSpell(SpellCastTargets const& targets, SpellInfo const
         originalCaster = triggeredByAura->GetCasterGUID();
     }
 
+    // A triggered cast by a caster in another task's area of a parallel map phase (an aura script reacting on its
+    // far target, a proc on the target's side) would write the caster: it runs on the caster's owner instead,
+    // the serial step after the phase, with the targets resolved again by GUID. The triggering aura effect is
+    // not kept (its owner may delete it in its own update before then); the original caster it implied is.
+    if (Map* map = FindMap(); map && triggerFlags != TRIGGERED_NONE && map->IsParallelPhase() && !map->CanWriteNow(this))
+    {
+        std::optional<CustomSpellValues> values;
+        if (value)
+            values = *value;
+
+        map->RunOnOwner(this, [castTargets = targets, spellInfo, values = std::move(values), triggerFlags, originalCaster,
+            castItemGuid = castItem ? castItem->GetGUID() : ObjectGuid::Empty](WorldObject* target) mutable
+        {
+            Unit* caster = target->ToUnit();
+            if (!caster || !caster->IsInWorld())
+                return;
+
+            castTargets.Update(caster);
+            if (castTargets.GetUnitTargetGUID() && !castTargets.GetUnitTarget())
+                return;
+
+            Item* item = nullptr;
+            if (castItemGuid)
+            {
+                Player* player = caster->ToPlayer();
+                item = player ? player->GetItemByGuid(castItemGuid) : nullptr;
+                if (!item)
+                    return;
+            }
+
+            caster->CastSpell(castTargets, spellInfo, values ? &*values : nullptr, triggerFlags, item, nullptr, originalCaster);
+        });
+        return SPELL_CAST_OK;
+    }
+
     Spell* spell = new Spell(this, spellInfo, triggerFlags, originalCaster);
 
     if (value)
@@ -2867,12 +2903,7 @@ void Unit::AttackerStateUpdate(Unit* victim, WeaponAttackType attType /*= BASE_A
     // Let the pet know we've started attacking someting. Handles melee attacks only
     // Spells such as auto-shot and others handled in WorldSession::HandleCastSpellOpcode
     if (IsPlayer())
-    {
-        for (Unit* controlled : m_Controlled)
-            if (Creature* cControlled = controlled->ToCreature())
-                if (CreatureAI* controlledAI = cControlled->AI())
-                    controlledAI->OwnerAttacked(victim);
-    }
+        NotifyControlledOwnerAttacked(victim);
 
     if (!extra && _lastExtraAttackSpell)
     {
@@ -11631,6 +11662,30 @@ void Unit::AddThreat(Unit* victim, float fThreat, SpellSchoolMask /*schoolMask*/
 }
 
 //======================================================================
+
+void Unit::NotifyControlledOwnerAttacked(Unit* victim)
+{
+    // a pet can be far from its master, in another task's area: its AI reacts (and attacks) on its owner
+    Map* map = FindMap();
+    for (Unit* controlled : m_Controlled)
+    {
+        Creature* pet = controlled->ToCreature();
+        if (!pet || !pet->IsAlive() || !pet->AI())
+            continue;
+
+        if (!map || map->CanWriteNow(pet))
+            pet->AI()->OwnerAttacked(victim);
+        else
+            map->RunOnOwner(pet, [victimGuid = victim ? victim->GetGUID() : ObjectGuid::Empty](WorldObject* target)
+            {
+                Creature* deferredPet = target->ToCreature();
+                if (!deferredPet || !deferredPet->IsInWorld() || !deferredPet->IsAlive() || !deferredPet->AI())
+                    return;
+
+                deferredPet->AI()->OwnerAttacked(victimGuid ? ObjectAccessor::GetUnit(*deferredPet, victimGuid) : nullptr);
+            });
+    }
+}
 
 void Unit::AtTargetAttacked(Unit* target, bool canInitialAggro)
 {
