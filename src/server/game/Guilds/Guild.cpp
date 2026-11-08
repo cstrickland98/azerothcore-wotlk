@@ -1117,11 +1117,19 @@ void Guild::Disband()
     sScriptMgr->OnGuildDisband(this);
 
     _BroadcastEvent(GE_DISBANDED);
-    // Remove all members
-    while (!m_members.empty())
+    // Remove all members (not under the members lock: DeleteMember calls scripts and broadcasts)
+    for (;;)
     {
-        auto itr = m_members.begin();
-        DeleteMember(itr->second.GetGUID(), true);
+        ObjectGuid memberGuid;
+        {
+            std::lock_guard<std::recursive_mutex> guard(_membersLock);
+            if (m_members.empty())
+                break;
+
+            memberGuid = m_members.begin()->second.GetGUID();
+        }
+
+        DeleteMember(memberGuid, true);
     }
 
     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
@@ -1225,6 +1233,7 @@ void Guild::HandleRoster(WorldSession* session)
     }
 
     bool sendOfficerNote = _HasRankRight(session->GetPlayer(), GR_RIGHT_VIEWOFFNOTE);
+    std::unique_lock<std::recursive_mutex> membersGuard(_membersLock);
     roster.MemberData.reserve(m_members.size());
     for (auto const& [guid, member] : m_members)
     {
@@ -1551,7 +1560,7 @@ void Guild::HandleLeaveMember(WorldSession* session)
     // If leader is leaving
     if (_IsLeader(player))
     {
-        if (m_members.size() > 1)
+        if (GetMemberCount() > 1)
             // Leader cannot leave if he is not the last member
             SendCommandResult(session, GUILD_COMMAND_QUIT, ERR_GUILD_LEADER_LEAVE);
         else
@@ -1833,7 +1842,7 @@ void Guild::SendInfo(WorldSession* session) const
     WorldPackets::Guild::GuildInfoResponse guildInfo;
     guildInfo.GuildName = m_name;
     guildInfo.CreateDate = m_createdDate;
-    guildInfo.NumMembers = int32(m_members.size());
+    guildInfo.NumMembers = int32(GetMemberCount());
     guildInfo.NumAccounts = m_accountsNumber;
 
     session->SendPacket(guildInfo.Write());
@@ -1842,13 +1851,16 @@ void Guild::SendInfo(WorldSession* session) const
 
 void Guild::SendEventLog(WorldSession* session) const
 {
-    std::list<EventLogEntry> const& eventLog = m_eventLog.GetGuildLog();
-
     WorldPackets::Guild::GuildEventLogQueryResults packet;
-    packet.Entry.reserve(eventLog.size());
+    {
+        std::lock_guard<std::recursive_mutex> guard(_membersLock);
+        std::list<EventLogEntry> const& eventLog = m_eventLog.GetGuildLog();
 
-    for (EventLogEntry const& entry : eventLog)
-        entry.WritePacket(packet);
+        packet.Entry.reserve(eventLog.size());
+
+        for (EventLogEntry const& entry : eventLog)
+            entry.WritePacket(packet);
+    }
 
     session->SendPacket(packet.Write());
     LOG_DEBUG("guild", "MSG_GUILD_EVENT_LOG_QUERY [{}]", session->GetPlayerInfo());
@@ -1859,14 +1871,17 @@ void Guild::SendBankLog(WorldSession* session, uint8 tabId) const
     // GUILD_BANK_MAX_TABS send by client for money log
     if (tabId < _GetPurchasedTabsSize() || tabId == GUILD_BANK_MAX_TABS)
     {
-        std::list<BankEventLogEntry> const& bankEventLog = m_bankEventLog[tabId].GetGuildLog();
-
         WorldPackets::Guild::GuildBankLogQueryResults packet;
         packet.Tab = tabId;
 
-        packet.Entry.reserve(bankEventLog.size());
-        for (BankEventLogEntry const& entry : bankEventLog)
-            entry.WritePacket(packet);
+        {
+            std::lock_guard<std::recursive_mutex> guard(_membersLock);
+            std::list<BankEventLogEntry> const& bankEventLog = m_bankEventLog[tabId].GetGuildLog();
+
+            packet.Entry.reserve(bankEventLog.size());
+            for (BankEventLogEntry const& entry : bankEventLog)
+                entry.WritePacket(packet);
+        }
 
         session->SendPacket(packet.Write());
         LOG_DEBUG("guild", "MSG_GUILD_BANK_LOG_QUERY [{}]", session->GetPlayerInfo());
@@ -1998,6 +2013,7 @@ bool Guild::LoadMemberFromDB(Field* fields)
     ObjectGuid::LowType lowguid = fields[1].Get<uint32>();
     ObjectGuid playerGuid(HighGuid::Player, lowguid);
 
+    std::unique_lock<std::recursive_mutex> membersGuard(_membersLock);
     auto [memberIt, isNew] = m_members.try_emplace(lowguid, m_id, playerGuid, fields[2].Get<uint8>());
     if (!isNew)
     {
@@ -2013,6 +2029,7 @@ bool Guild::LoadMemberFromDB(Field* fields)
         return false;
     }
 
+    membersGuard.unlock();
     sCharacterCache->UpdateCharacterGuildId(playerGuid, GetId());
     return true;
 }
@@ -2027,6 +2044,7 @@ void Guild::LoadBankRightFromDB(Field* fields)
 
 bool Guild::LoadEventLogFromDB(Field* fields)
 {
+    std::lock_guard<std::recursive_mutex> guard(_membersLock);
     if (m_eventLog.CanInsert())
     {
         m_eventLog.LoadEvent(
@@ -2049,6 +2067,7 @@ bool Guild::LoadBankEventLogFromDB(Field* fields)
     if (dbTabId < _GetPurchasedTabsSize() || isMoneyTab)
     {
         uint8 tabId = isMoneyTab ? uint8(GUILD_BANK_MAX_TABS) : dbTabId;
+        std::lock_guard<std::recursive_mutex> guard(_membersLock);
         LogHolder<BankEventLogEntry>& bankLog = m_bankEventLog[tabId];
         if (bankLog.CanInsert())
         {
@@ -2161,9 +2180,12 @@ bool Guild::Validate()
     }
 
     // Validate members' data
-    for (auto& [guid, member] : m_members)
-        if (member.GetRankId() > _GetRanksSize())
-            member.ChangeRank(_GetLowestRankId());
+    {
+        std::lock_guard<std::recursive_mutex> guard(_membersLock);
+        for (auto& [guid, member] : m_members)
+            if (member.GetRankId() > _GetRanksSize())
+                member.ChangeRank(_GetLowestRankId());
+    }
 
     // Repair the structure of the guild.
     // If the guildmaster doesn't exist or isn't member of the guild
@@ -2173,7 +2195,7 @@ bool Guild::Validate()
     {
         DeleteMember(m_leaderGuid);
         // If no more members left, disband guild
-        if (m_members.empty())
+        if (!GetMemberCount())
         {
             Disband();
             return false;
@@ -2184,9 +2206,12 @@ bool Guild::Validate()
 
     // Check config if multiple guildmasters are allowed
     if (!sConfigMgr->GetOption<bool>("Guild.AllowMultipleGuildMaster", 0))
+    {
+        std::lock_guard<std::recursive_mutex> guard(_membersLock);
         for (auto& [guid, member] : m_members)
             if ((member.GetRankId() == GR_GUILDMASTER) && !member.IsSamePlayer(m_leaderGuid))
                 member.ChangeRank(GR_OFFICER);
+    }
 
     _UpdateAccountsNumber();
     return true;
@@ -2199,6 +2224,7 @@ void Guild::BroadcastToGuild(WorldSession* session, bool officerOnly, std::strin
     {
         WorldPacket data;
         ChatHandler::BuildChatPacket(data, officerOnly ? CHAT_MSG_OFFICER : CHAT_MSG_GUILD, Language(language), session->GetPlayer(), nullptr, msg);
+        std::lock_guard<std::recursive_mutex> guard(_membersLock);
         for (auto const& [guid, member] : m_members)
             if (Player* player = member.FindPlayer())
                 if (_HasRankRight(player, officerOnly ? GR_RIGHT_OFFCHATLISTEN : GR_RIGHT_GCHATLISTEN) && !player->GetSocial()->HasIgnore(session->GetPlayer()->GetGUID()))
@@ -2208,6 +2234,7 @@ void Guild::BroadcastToGuild(WorldSession* session, bool officerOnly, std::strin
 
 void Guild::BroadcastPacketToRank(WorldPacket const* packet, uint8 rankId) const
 {
+    std::lock_guard<std::recursive_mutex> guard(_membersLock);
     for (auto const& [guid, member] : m_members)
         if (member.IsRank(rankId))
             if (Player* player = member.FindPlayer())
@@ -2216,6 +2243,7 @@ void Guild::BroadcastPacketToRank(WorldPacket const* packet, uint8 rankId) const
 
 void Guild::BroadcastPacket(WorldPacket const* packet) const
 {
+    std::lock_guard<std::recursive_mutex> guard(_membersLock);
     for (auto const& [guid, member] : m_members)
         if (Player* player = member.FindPlayer())
             player->SendDirectMessage(packet);
@@ -2228,6 +2256,7 @@ void Guild::MassInviteToEvent(WorldSession* session, uint32 minLevel, uint32 max
     WorldPacket data(SMSG_CALENDAR_FILTER_GUILD);
     data << uint32(count); // count placeholder
 
+    std::unique_lock<std::recursive_mutex> membersGuard(_membersLock);
     for (auto const& [guid, member] : m_members)
     {
         // not sure if needed, maybe client checks it as well
@@ -2248,6 +2277,7 @@ void Guild::MassInviteToEvent(WorldSession* session, uint32 minLevel, uint32 max
         }
     }
 
+    membersGuard.unlock();
     data.put<uint32>(0, count);
 
     session->SendPacket(&data);
@@ -2276,12 +2306,15 @@ bool Guild::AddMember(ObjectGuid guid, uint8 rankId)
     if (rankId == GUILD_RANK_NONE)
         rankId = _GetLowestRankId();
 
+    std::unique_lock<std::recursive_mutex> membersGuard(_membersLock);
     auto [memberIt, isNew] = m_members.try_emplace(lowguid, m_id, guid, rankId);
     if (!isNew)
     {
         LOG_ERROR("guild", "Tried to add {} to guild '{}'. Member already exists.", guid.ToString(), m_name);
         return false;
     }
+
+    membersGuard.unlock();
 
     Member& member = memberIt->second;
     std::string name;
@@ -2319,6 +2352,7 @@ bool Guild::AddMember(ObjectGuid guid, uint8 rankId)
         }
         if (!ok)
         {
+            membersGuard.lock();
             m_members.erase(memberIt);
             return false;
         }
@@ -2349,12 +2383,15 @@ void Guild::DeleteMember(ObjectGuid guid, bool isDisbanding, bool isKicked, bool
     {
         Member* oldLeader = nullptr;
         Member* newLeader = nullptr;
-        for (auto& [guid, member] : m_members)
         {
-            if (guid == lowguid)
-                oldLeader = &member;
-            else if (!newLeader || newLeader->GetRankId() > member.GetRankId())
-                newLeader = &member;
+            std::lock_guard<std::recursive_mutex> guard(_membersLock);
+            for (auto& [guid, member] : m_members)
+            {
+                if (guid == lowguid)
+                    oldLeader = &member;
+                else if (!newLeader || newLeader->GetRankId() > member.GetRankId())
+                    newLeader = &member;
+            }
         }
 
         if (!newLeader)
@@ -2381,7 +2418,10 @@ void Guild::DeleteMember(ObjectGuid guid, bool isDisbanding, bool isKicked, bool
     // Call script on remove before member is actually removed from guild (and database)
     sScriptMgr->OnGuildRemoveMember(this, player, isDisbanding, isKicked);
 
-    m_members.erase(lowguid);
+    {
+        std::lock_guard<std::recursive_mutex> guard(_membersLock);
+        m_members.erase(lowguid);
+    }
 
     // If player not online data in data field will be loaded from guild tabs no need to update it !!
     if (player)
@@ -2518,8 +2558,11 @@ void Guild::_UpdateAccountsNumber()
 {
     // We use a set to be sure each element will be unique
     std::unordered_set<uint32> accountsIdSet;
-    for (auto const& [guid, member] : m_members)
-        accountsIdSet.insert(member.GetAccountId());
+    {
+        std::lock_guard<std::recursive_mutex> guard(_membersLock);
+        for (auto const& [guid, member] : m_members)
+            accountsIdSet.insert(member.GetAccountId());
+    }
 
     m_accountsNumber = accountsIdSet.size();
 }
@@ -2697,7 +2740,10 @@ bool Guild::MemberHasTabRights(ObjectGuid guid, uint8 tabId, uint32 rights) cons
 inline void Guild::_LogEvent(GuildEventLogTypes eventType, ObjectGuid playerGuid1, ObjectGuid playerGuid2, uint8 newRank)
 {
     CharacterDatabaseTransaction trans = CharacterDatabase.BeginTransaction();
-    m_eventLog.AddEvent(trans, m_id, m_eventLog.GetNextGUID(), eventType, playerGuid1, playerGuid2, newRank);
+    {
+        std::lock_guard<std::recursive_mutex> guard(_membersLock);
+        m_eventLog.AddEvent(trans, m_id, m_eventLog.GetNextGUID(), eventType, playerGuid1, playerGuid2, newRank);
+    }
     CharacterDatabase.CommitTransaction(trans);
 
     sScriptMgr->OnGuildEvent(this, uint8(eventType), playerGuid1.GetCounter(), playerGuid2.GetCounter(), newRank);
@@ -2719,8 +2765,11 @@ void Guild::_LogBankEvent(CharacterDatabaseTransaction trans, GuildBankEventLogT
         tabId = GUILD_BANK_MAX_TABS;
         dbTabId = GUILD_BANK_MONEY_LOGS_TAB;
     }
-    LogHolder<BankEventLogEntry>& pLog = m_bankEventLog[tabId];
-    pLog.AddEvent(trans, m_id, pLog.GetNextGUID(), eventType, dbTabId, guid, itemOrMoney, itemStackCount, destTabId);
+    {
+        std::lock_guard<std::recursive_mutex> guard(_membersLock);
+        LogHolder<BankEventLogEntry>& pLog = m_bankEventLog[tabId];
+        pLog.AddEvent(trans, m_id, pLog.GetNextGUID(), eventType, dbTabId, guid, itemOrMoney, itemStackCount, destTabId);
+    }
 
     sScriptMgr->OnGuildBankEvent(this, uint8(eventType), tabId, guid.GetCounter(), itemOrMoney, itemStackCount, destTabId);
 }
@@ -2996,6 +3045,7 @@ void Guild::_SendBankList(WorldSession* session /* = nullptr*/, uint8 tabId /*= 
     else
     {
         packet.Write();
+        std::lock_guard<std::recursive_mutex> guard(_membersLock);
         for (auto const& [guid, member] : m_members)
         {
             if (!member.ShouldReceiveBankPartialUpdatePackets())
@@ -3018,8 +3068,11 @@ void Guild::_SendBankList(WorldSession* session /* = nullptr*/, uint8 tabId /*= 
 
 void Guild::ResetTimes()
 {
-    for (auto& [guid, member] : m_members)
-        member.ResetValues();
+    {
+        std::lock_guard<std::recursive_mutex> guard(_membersLock);
+        for (auto& [guid, member] : m_members)
+            member.ResetValues();
+    }
 
     _BroadcastEvent(GE_BANK_TAB_AND_MONEY_UPDATED, ObjectGuid::Empty);
 }

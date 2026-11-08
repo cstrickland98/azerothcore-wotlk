@@ -22,6 +22,7 @@
 #include "ObjectMgr.h"
 #include "Optional.h"
 #include "Player.h"
+#include <mutex>
 #include <set>
 #include <unordered_map>
 
@@ -383,16 +384,19 @@ public: // pussywizard: public class Member
     // pussywizard: public GetMember
     inline Member const* GetMember(ObjectGuid guid) const
     {
+        std::lock_guard<std::recursive_mutex> guard(_membersLock);
         auto itr = m_members.find(guid.GetCounter());
         return (itr != m_members.end()) ? &itr->second : nullptr;
     }
     inline Member* GetMember(ObjectGuid guid)
     {
+        std::lock_guard<std::recursive_mutex> guard(_membersLock);
         auto itr = m_members.find(guid.GetCounter());
         return (itr != m_members.end()) ? &itr->second : nullptr;
     }
     inline Member* GetMember(std::string_view name)
     {
+        std::lock_guard<std::recursive_mutex> guard(_membersLock);
         for (auto& m_member : m_members)
             if (m_member.second.GetName() == name)
                 return &m_member.second;
@@ -758,6 +762,7 @@ public:
     template<class Do>
     void BroadcastWorker(Do& _do, Player* except = nullptr)
     {
+        std::lock_guard<std::recursive_mutex> guard(_membersLock);
         for (auto const& m_member : m_members)
             if (Player* player = m_member.second.FindPlayer())
                 if (player != except)
@@ -776,7 +781,7 @@ public:
 
     // pussywizard
     uint64 GetTotalBankMoney() const { return m_bankMoney; }
-    uint32 GetMemberCount() const { return m_members.size(); }
+    uint32 GetMemberCount() const { std::lock_guard<std::recursive_mutex> guard(_membersLock); return m_members.size(); }
     time_t GetCreatedDate() const { return m_createdDate; }
 
     // Bank tabs
@@ -785,7 +790,8 @@ public:
     void ResetTimes();
 
     [[nodiscard]] bool ModifyBankMoney(CharacterDatabaseTransaction trans, uint64 const& amount, bool add) { return _ModifyBankMoney(trans, amount, add); }
-    [[nodiscard]] uint32 GetMemberSize() const { return m_members.size(); }
+    [[nodiscard]] uint32 GetMemberSize() const { std::lock_guard<std::recursive_mutex> guard(_membersLock); return m_members.size(); }
+    // Not locked: walk it only where no other thread can add or remove members (world thread, loading).
     [[nodiscard]] std::unordered_map<uint32, Member> const& GetUnorderedMembers() const { return m_members; }
 
     bool HasRankRight(Player* player, uint32 right) const;
@@ -811,6 +817,11 @@ protected:
     // These are actually ordered lists. The first element is the oldest entry.
     LogHolder<EventLogEntry> m_eventLog;
     std::array<LogHolder<BankEventLogEntry>, GUILD_BANK_MAX_TABS + 1> m_bankEventLog = {};
+
+    // Guards m_members (lookups, inserts, erases, walks) and the event / bank logs: members join, leave and look
+    // each other up from their own map threads (several per continent with MapUpdate.ThreadsPerMap > 1).
+    // Recursive: broadcasts and DeleteMember nest. Lock order: a group's lock before this one, never the reverse.
+    mutable std::recursive_mutex _membersLock;
 
 private:
     inline uint8 _GetRanksSize() const { return uint8(m_ranks.size()); }
