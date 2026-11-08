@@ -979,6 +979,7 @@ public:
     [[nodiscard]] bool CanHaveThreatList(bool skipAliveCheck = false) const;
     void AddThreat(Unit* victim, float fThreat, SpellSchoolMask schoolMask = SPELL_SCHOOL_MASK_NORMAL, SpellInfo const* threatSpell = nullptr);
     void AtTargetAttacked(Unit* target, bool canInitialAggro);
+    void NotifyControlledOwnerAttacked(Unit* victim);     // pets' AI OwnerAttacked, far pets on their owner
 
     // ThreatManager/CombatManager accessors
     ThreatManager& GetThreatMgr() { return m_threatManager; }
