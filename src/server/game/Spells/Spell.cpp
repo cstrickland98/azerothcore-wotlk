@@ -3623,7 +3623,7 @@ bool Spell::UpdateChanneledTargetList()
                             if (!m_caster->IsWithinDistInMap(unit, range))
                             {
                                 ihit->effectMask &= ~aurApp->GetEffectMask();
-                                unit->RemoveAura(aurApp);
+                                RemoveChannelTargetAura(unit, aurApp);
                                 continue;
                             }
                             // Xinef: Update Orientation server side (non players wont sent appropriate packets)
@@ -3650,12 +3650,29 @@ bool Spell::UpdateChanneledTargetList()
                         if (AuraApplication* aurApp = unit->GetAuraApplication(m_spellInfo->Id, m_originalCasterGUID))
                         {
                             ihit->effectMask &= ~aurApp->GetEffectMask();
-                            unit->RemoveAura(aurApp);
+                            RemoveChannelTargetAura(unit, aurApp);
                         }
     }
 
     // is all effects from m_needAliveTargetMask have alive targets
     return channelTargetEffectMask == 0;
+}
+
+// a channel target out of range or no longer covered may sit in a grid another task is updating
+void Spell::RemoveChannelTargetAura(Unit* unit, AuraApplication* aurApp)
+{
+    Map* map = m_caster->FindMap();
+    if (unit == m_caster || !map || !map->IsParallelPhase() || map->CanWriteNow(unit))
+    {
+        unit->RemoveAura(aurApp);
+        return;
+    }
+
+    map->RunOnOwner(unit, [spellId = m_spellInfo->Id, casterGuid = m_originalCasterGUID](WorldObject* target)
+    {
+        if (Unit* owner = target->ToUnit())
+            owner->RemoveAura(spellId, casterGuid);
+    });
 }
 
 SpellCastResult Spell::prepare(SpellCastTargets const* targets, AuraEffect const* triggeredByAura)

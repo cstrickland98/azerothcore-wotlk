@@ -17,6 +17,7 @@
 
 #include "Config.h"
 #include "Creature.h"
+#include "Map.h"
 #include "Pet.h"
 #include "Player.h"
 #include "ScriptMgr.h"
@@ -1320,6 +1321,19 @@ void Guardian::UpdateAttackPowerAndDamage(bool ranged)
 {
     if (ranged)
         return;
+
+    // the master's aura handlers call this for a pet whose grid another task may be updating:
+    // the recalculation reads only the pet's own stats, so run it in the pet's owner
+    if (Map* map = FindMap(); map && map->IsParallelPhase() && !map->CanWriteNow(this))
+    {
+        map->RunOnOwner(this, [](WorldObject* target)
+        {
+            Unit* unit = target->ToUnit();
+            if (unit && unit->IsInWorld() && unit->IsGuardian())
+                static_cast<Guardian*>(unit)->UpdateAttackPowerAndDamage();
+        });
+        return;
+    }
 
     float val = 0.0f;
     UnitMods unitMod = UNIT_MOD_ATTACK_POWER;
