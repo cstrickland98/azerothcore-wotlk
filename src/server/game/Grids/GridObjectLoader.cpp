@@ -26,6 +26,7 @@
 #include "PoolMgr.h"
 #include "Transport.h"
 #include "Vehicle.h"
+#include <type_traits>
 
 template <class T>
 void GridObjectLoader::AddObjectHelper(Map* map, T* obj)
@@ -147,6 +148,11 @@ void GridObjectUnloader::Visit(GridRefMgr<T>& m)
         obj->CleanupsBeforeDelete();
 
         obj->GetMap()->RemoveObjectFromMapUpdateList(obj);
+
+        // With several threads per map the delayed visibility set lives across ticks
+        if constexpr (std::is_base_of_v<Unit, T>)
+            if (obj->GetMap()->GetThreadsPerMap() > 1)
+                obj->GetMap()->ForgetDelayedVisibility(obj);
 
         ///- object will get delinked from the manager when deleted
         delete obj;
