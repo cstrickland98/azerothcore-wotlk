@@ -43,6 +43,7 @@
 #include "Group.h"
 #include "Log.h"
 #include "MapMgr.h"
+#include "MapThreading.h"
 #include "MoveSpline.h"
 #include "MoveSplineInit.h"
 #include "MovementGenerator.h"
@@ -253,6 +254,14 @@ DamageInfo::DamageInfo(SpellNonMeleeDamage const& spellNonMeleeDamage, DamageEff
         else
             m_hitMask |= PROC_HIT_NORMAL;
     }
+}
+
+DamageInfo::DamageInfo(DamageInfo const& other, Unit* attacker, Unit* victim)
+    : m_attacker(attacker), m_victim(victim), m_damage(other.m_damage), m_spellInfo(other.m_spellInfo),
+      m_schoolMask(other.m_schoolMask), m_damageType(other.m_damageType), m_attackType(other.m_attackType),
+      m_absorb(other.m_absorb), m_resist(other.m_resist), m_block(other.m_block), m_cleanDamage(other.m_cleanDamage),
+      m_hitMask(other.m_hitMask), m_skipCombat(other.m_skipCombat)
+{
 }
 
 void DamageInfo::ModifyDamage(int32 amount)
@@ -528,7 +537,7 @@ void Unit::Update(uint32 p_time)
             {
                 m_delayed_unit_relocation_timer = 0;
                 //ExecuteDelayedUnitRelocationEvent();
-                FindMap()->i_objectsForDelayedVisibility.insert(this);
+                FindMap()->AddUnitToDelayedVisibility(this);
             }
             else
                 m_delayed_unit_relocation_timer -= p_time;
@@ -882,6 +891,12 @@ Unit* Unit::getAttackerForHelper() const
 
     if (!IsEngaged())
         return nullptr;
+
+    if (IsLinkLockNeeded())
+    {
+        std::lock_guard<std::mutex> lock(_linkLock);
+        return m_attackers.empty() ? nullptr : *(m_attackers.begin());
+    }
 
     if (!m_attackers.empty())
         return *(m_attackers.begin());
@@ -2880,7 +2895,14 @@ bool Unit::GetMeleeAttackPoint(Unit* attacker, Position& pos)
         return false;
     }
 
-    AttackerSet attackers = getAttackers();
+    AttackerSet attackers;
+    if (IsLinkLockNeeded())
+    {
+        std::lock_guard<std::mutex> lock(_linkLock);
+        attackers = m_attackers;
+    }
+    else
+        attackers = m_attackers;
 
     if (attackers.size() <= 1) // if the attackers are not more than one
     {
@@ -4512,6 +4534,7 @@ Aura* Unit::_TryStackingOrRefreshingExistingAura(SpellInfo const* newAura, uint8
 
 void Unit::_AddAura(UnitAura* aura, Unit* caster)
 {
+    MT_ASSERT_WRITABLE(this);
     ASSERT(!m_cleanupDone);
     m_ownedAuras.insert(AuraMap::value_type(aura->GetId(), aura));
     _AddAuraToUpdateList(aura);
@@ -4604,6 +4627,7 @@ void Unit::_ApplyAuraEffect(Aura* aura, uint8 effIndex)
 // should be done after registering aura in lists
 void Unit::_ApplyAura(AuraApplication* aurApp, uint8 effMask)
 {
+    MT_ASSERT_WRITABLE(this);
     Aura* aura = aurApp->GetBase();
 
     _RemoveNoStackAurasDueToAura(aura, false);
@@ -4650,6 +4674,7 @@ void Unit::_ApplyAura(AuraApplication* aurApp, uint8 effMask)
 // removes aura application from lists and unapplies effects
 void Unit::_UnapplyAura(AuraApplicationMap::iterator& i, AuraRemoveMode removeMode)
 {
+    MT_ASSERT_WRITABLE(this);
     AuraApplication* aurApp = i->second;
     ASSERT(aurApp);
     ASSERT(!aurApp->GetRemoveMode());
@@ -4798,6 +4823,7 @@ void Unit::_RegisterAuraEffect(AuraEffect* aurEff, bool apply)
 // All aura base removes should go threw this function!
 void Unit::RemoveOwnedAura(AuraMap::iterator& i, AuraRemoveMode removeMode)
 {
+    MT_ASSERT_WRITABLE(this);
     Aura* aura = i->second;
     ASSERT(!aura->IsRemoved());
 
@@ -6626,16 +6652,15 @@ void Unit::SendSpellNonMeleeDamageLog(Unit* target, SpellInfo const* spellInfo, 
 
 void Unit::ProcSkillsAndAuras(Unit* actor, Unit* victim, uint32 procAttacker, uint32 procVictim, uint32 procExtra, uint32 amount, WeaponAttackType attType, SpellInfo const* procSpellInfo, SpellInfo const* procAura, int8 procAuraEffectIndex, Spell const* procSpell, DamageInfo* damageInfo, HealInfo* healInfo, uint32 procPhase)
 {
-    // Handle skills and reactives for actor
-    if (procAttacker && actor)
-        actor->ProcSkillsAndReactives(false, victim, procAttacker, procExtra, attType, procSpellInfo, amount, procAura, procAuraEffectIndex, procSpell, damageInfo, healInfo, procPhase);
-
-    // Handle skills and reactives for victim
-    if (victim && victim->IsAlive() && procVictim)
-        victim->ProcSkillsAndReactives(true, actor, procVictim, procExtra, attType, procSpellInfo, amount, procAura, procAuraEffectIndex, procSpell, damageInfo, healInfo, procPhase);
-
-    // Handle aura procs via new proc system (TriggerAurasProcOnEvent)
-    if (actor)
+    // the actor-side procs of the actor's own auras and skills
+    auto procActorSkills = [=](Unit* procActor, Unit* procVictimUnit, Spell const* spell, DamageInfo* damage,
+        HealInfo* heal)
+    {
+        procActor->ProcSkillsAndReactives(false, procVictimUnit, procAttacker, procExtra, attType, procSpellInfo, amount,
+            procAura, procAuraEffectIndex, spell, damage, heal, procPhase);
+    };
+    auto procActorAuras = [=](Unit* procActor, Unit* procVictimUnit, Spell const* spell, DamageInfo* damage,
+        HealInfo* heal)
     {
         // Calculate spellTypeMask based on phase and actual damage/heal info
         uint32 spellTypeMask = 0;
@@ -6647,15 +6672,70 @@ void Unit::ProcSkillsAndAuras(Unit* actor, Unit* victim, uint32 procAttacker, ui
             // to match TrinityCore behavior (see TC Spell.cpp PROC_SPELL_PHASE_FINISH call)
             spellTypeMask = PROC_SPELL_TYPE_MASK_ALL;
         }
-        else if (healInfo && healInfo->GetHeal())
+        else if (heal && heal->GetHeal())
             spellTypeMask = PROC_SPELL_TYPE_HEAL;
-        else if (damageInfo && (damageInfo->GetDamage() || damageInfo->GetAbsorb()))
+        else if (damage && (damage->GetDamage() || damage->GetAbsorb()))
             spellTypeMask = PROC_SPELL_TYPE_DAMAGE;
         else if (procSpellInfo)
             spellTypeMask = PROC_SPELL_TYPE_NO_DMG_HEAL;
 
-        actor->TriggerAurasProcOnEvent(nullptr, nullptr, victim, procAttacker, procVictim, spellTypeMask, procPhase, procExtra, const_cast<Spell*>(procSpell), damageInfo, healInfo);
+        procActor->TriggerAurasProcOnEvent(nullptr, nullptr, procVictimUnit, procAttacker, procVictim, spellTypeMask,
+            procPhase, procExtra, const_cast<Spell*>(spell), damage, heal);
+    };
+
+    // A periodic tick on a victim far from its caster: the actor side runs on the actor's owner, with copied values
+    if (actor && victim && actor != victim)
+    {
+        Map* map = victim->FindMap();
+        if (map && !map->CanWriteNow(actor))
+        {
+            if (victim->IsAlive() && procVictim)
+                victim->ProcSkillsAndReactives(true, actor, procVictim, procExtra, attType, procSpellInfo, amount, procAura,
+                    procAuraEffectIndex, procSpell, damageInfo, healInfo, procPhase);
+
+            std::optional<DamageInfo> damageCopy;
+            if (damageInfo)
+                damageCopy.emplace(*damageInfo, nullptr, nullptr);
+            std::optional<HealInfo> healCopy;
+            if (healInfo)
+                healCopy.emplace(*healInfo, nullptr, nullptr);
+
+            map->RunOnOwner(actor, [procActorSkills, procActorAuras, victimGuid = victim->GetGUID(), procAttacker,
+                damageCopy, healCopy](WorldObject* target)
+            {
+                Unit* deferredActor = target->ToUnit();
+                Unit* deferredVictim = ObjectAccessor::GetUnit(*target, victimGuid);
+                if (!deferredActor || !deferredVictim)
+                    return;
+
+                std::optional<DamageInfo> damage;
+                if (damageCopy)
+                    damage.emplace(*damageCopy, deferredActor, deferredVictim);
+                std::optional<HealInfo> heal;
+                if (healCopy)
+                    heal.emplace(*healCopy, deferredActor, deferredVictim);
+
+                DamageInfo* damagePtr = damage ? &*damage : nullptr;
+                HealInfo* healPtr = heal ? &*heal : nullptr;
+                if (procAttacker)
+                    procActorSkills(deferredActor, deferredVictim, nullptr, damagePtr, healPtr);
+                procActorAuras(deferredActor, deferredVictim, nullptr, damagePtr, healPtr);
+            });
+            return;
+        }
     }
+
+    // Handle skills and reactives for actor
+    if (procAttacker && actor)
+        procActorSkills(actor, victim, procSpell, damageInfo, healInfo);
+
+    // Handle skills and reactives for victim
+    if (victim && victim->IsAlive() && procVictim)
+        victim->ProcSkillsAndReactives(true, actor, procVictim, procExtra, attType, procSpellInfo, amount, procAura, procAuraEffectIndex, procSpell, damageInfo, healInfo, procPhase);
+
+    // Handle aura procs via new proc system (TriggerAurasProcOnEvent)
+    if (actor)
+        procActorAuras(actor, victim, procSpell, damageInfo, healInfo);
 }
 
 void Unit::SendPeriodicAuraLog(SpellPeriodicAuraLogInfo* pInfo)
@@ -7436,15 +7516,60 @@ void Unit::AtEngage(Unit* /*target*/)
  */
 void Unit::RemoveAllAttackers()
 {
+    if (IsLinkLockNeeded())
+    {
+        // an attacker can be far, in another task's area: its AttackStop runs on its owner
+        AttackerSet attackersCopy;
+        ObjectGuid const victimGuid = GetGUID();
+        for (Unit* attacker : GetAttackersForIteration(attackersCopy))
+            GetMap()->RunOnOwner(attacker, [victimGuid](WorldObject* target)
+            {
+                Unit* unit = target->ToUnit();
+                if (unit && unit->GetVictim() && unit->GetVictim()->GetGUID() == victimGuid)
+                    unit->AttackStop();
+            });
+        return;
+    }
+
     while (!m_attackers.empty())
     {
         AttackerSet::iterator iter = m_attackers.begin();
         if (!(*iter)->AttackStop())
         {
             LOG_ERROR("entities.unit", "WORLD: Unit has an attacker that isn't attacking it!");
+            std::lock_guard<std::mutex> lock(_linkLock);
             m_attackers.erase(iter);
         }
     }
+}
+
+void Unit::_addAttacker(Unit* pAttacker)
+{
+    MT_ASSERT_WRITABLE(this);
+    std::lock_guard<std::mutex> lock(_linkLock);
+    m_attackers.insert(pAttacker);
+}
+
+void Unit::_removeAttacker(Unit* pAttacker)
+{
+    std::lock_guard<std::mutex> lock(_linkLock);
+    m_attackers.erase(pAttacker);
+}
+
+bool Unit::IsLinkLockNeeded() const
+{
+    Map const* map = FindMap();
+    return map && map->IsParallelPhase();
+}
+
+Unit::AttackerSet const& Unit::GetAttackersForIteration(AttackerSet& copy) const
+{
+    if (!IsLinkLockNeeded())
+        return m_attackers;
+
+    std::lock_guard<std::mutex> lock(_linkLock);
+    copy = m_attackers;
+    return copy;
 }
 
 void Unit::ModifyAuraState(AuraStateType flag, bool apply)
@@ -7637,6 +7762,7 @@ Unit* Unit::GetCharm() const
 
 void Unit::SetMinion(Minion* minion, bool apply)
 {
+    MT_ASSERT_WRITABLE(this);
     LOG_DEBUG("entities.unit", "SetMinion {} for {}, apply {}", minion->GetEntry(), GetEntry(), apply);
 
     if (apply)
@@ -7828,6 +7954,7 @@ void Unit::RemoveAllMinionsByEntry(uint32 entry)
 
 void Unit::SetCharm(Unit* charm, bool apply)
 {
+    MT_ASSERT_WRITABLE(this);
     if (apply)
     {
         if (IsPlayer())
@@ -8133,6 +8260,7 @@ Unit* Unit::GetNextRandomRaidMemberOrPet(float radius)
 // so move it to Player?
 void Unit::AddPlayerToVision(Player* player)
 {
+    MT_ASSERT_WRITABLE(this);
     if (m_sharedVision.empty())
         setActive(true);
 
@@ -15825,16 +15953,32 @@ void Unit::StopAttackFaction(uint32 faction_id)
         }
     }
 
-    AttackerSet const& attackers = getAttackers();
-    for (AttackerSet::const_iterator itr = attackers.begin(); itr != attackers.end();)
+    if (IsLinkLockNeeded())
     {
-        if ((*itr)->GetFactionTemplateEntry()->faction == faction_id)
+        AttackerSet attackersCopy;
+        ObjectGuid const victimGuid = GetGUID();
+        for (Unit* attacker : GetAttackersForIteration(attackersCopy))
+            GetMap()->RunOnOwner(attacker, [victimGuid, faction_id](WorldObject* target)
+            {
+                Unit* unit = target->ToUnit();
+                if (unit && unit->GetVictim() && unit->GetVictim()->GetGUID() == victimGuid &&
+                    unit->GetFactionTemplateEntry()->faction == faction_id)
+                    unit->AttackStop();
+            });
+    }
+    else
+    {
+        AttackerSet const& attackers = getAttackers();
+        for (AttackerSet::const_iterator itr = attackers.begin(); itr != attackers.end();)
         {
-            (*itr)->AttackStop();
-            itr = attackers.begin();
+            if ((*itr)->GetFactionTemplateEntry()->faction == faction_id)
+            {
+                (*itr)->AttackStop();
+                itr = attackers.begin();
+            }
+            else
+                ++itr;
         }
-        else
-            ++itr;
     }
 
     // Collect GUIDs, not pointers: EndCombat can cascade through AI callbacks
@@ -15857,6 +16001,29 @@ void Unit::StopAttackFaction(uint32 faction_id)
 
 void Unit::StopAttackingInvalidTarget()
 {
+    if (IsLinkLockNeeded())
+    {
+        AttackerSet attackersCopy;
+        ObjectGuid const victimGuid = GetGUID();
+        for (Unit* attacker : GetAttackersForIteration(attackersCopy))
+            GetMap()->RunOnOwner(attacker, [victimGuid](WorldObject* target)
+            {
+                Unit* unit = target->ToUnit();
+                Unit* victim = unit ? unit->GetVictim() : nullptr;
+                if (!victim || victim->GetGUID() != victimGuid || unit->IsValidAttackTarget(victim))
+                    return;
+
+                unit->AttackStop();
+                if (unit->IsPlayer())
+                    unit->ToPlayer()->SendAttackSwingCancelAttack();
+
+                for (Unit* controlled : unit->m_Controlled)
+                    if (controlled->GetVictim() == victim && !controlled->IsValidAttackTarget(victim))
+                        controlled->AttackStop();
+            });
+        return;
+    }
+
     AttackerSet const& attackers = getAttackers();
     for (AttackerSet::const_iterator itr = attackers.begin(); itr != attackers.end();)
     {

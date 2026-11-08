@@ -29,6 +29,8 @@
 #include "Creature.h"
 #include "CreatureAI.h"
 #include "CreatureGroups.h"
+#include "Map.h"
+#include "MapThreading.h"
 #include "MotionMaster.h"
 #include "ObjectAccessor.h"
 #include "Player.h"
@@ -41,6 +43,19 @@
 #include "WorldPacket.h"
 #include <algorithm>
 #include <boost/heap/fibonacci_heap.hpp>
+#include <mutex>
+
+namespace
+{
+    // the unit's link lock, taken only while its map runs a parallel phase
+    std::unique_lock<std::mutex> LockLinksIfNeeded(Unit const* unit)
+    {
+        std::unique_lock<std::mutex> lock(unit->GetLinkLock(), std::defer_lock);
+        if (unit->IsLinkLockNeeded())
+            lock.lock();
+        return lock;
+    }
+}
 
 const CompareThreatLessThan ThreatManager::CompareThreat;
 
@@ -354,6 +369,7 @@ std::vector<ThreatReference*> ThreatManager::GetModifiableThreatList()
 
 bool ThreatManager::IsThreateningAnyone(bool includeOffline) const
 {
+    std::unique_lock<std::mutex> const lock = LockLinksIfNeeded(_owner);
     if (includeOffline)
         return !_threatenedByMe.empty();
     for (auto const& pair : _threatenedByMe)
@@ -364,6 +380,7 @@ bool ThreatManager::IsThreateningAnyone(bool includeOffline) const
 
 bool ThreatManager::IsThreateningTo(ObjectGuid const& who, bool includeOffline) const
 {
+    std::unique_lock<std::mutex> const lock = LockLinksIfNeeded(_owner);
     auto it = _threatenedByMe.find(who);
     if (it == _threatenedByMe.end())
         return false;
@@ -373,24 +390,32 @@ bool ThreatManager::IsThreateningTo(Unit const* who, bool includeOffline) const 
 
 void ThreatManager::EvaluateSuppressed(bool canExpire)
 {
-    for (auto const& pair : _threatenedByMe)
+    auto evaluate = [canExpire](ThreatReference* ref)
     {
-        bool const shouldBeSuppressed = pair.second->ShouldBeSuppressed();
-        if (pair.second->IsOnline() && shouldBeSuppressed)
+        bool const shouldBeSuppressed = ref->ShouldBeSuppressed();
+        if (ref->IsOnline() && shouldBeSuppressed)
         {
-            pair.second->_online = ThreatReference::ONLINE_STATE_SUPPRESSED;
-            pair.second->HeapNotifyDecreased();
+            ref->_online = ThreatReference::ONLINE_STATE_SUPPRESSED;
+            ref->HeapNotifyDecreased();
         }
-        else if (canExpire && pair.second->IsSuppressed() && !shouldBeSuppressed)
+        else if (canExpire && ref->IsSuppressed() && !shouldBeSuppressed)
         {
-            pair.second->_online = ThreatReference::ONLINE_STATE_ONLINE;
-            pair.second->HeapNotifyIncreased();
+            ref->_online = ThreatReference::ONLINE_STATE_ONLINE;
+            ref->HeapNotifyIncreased();
         }
-    }
+    };
+
+    if (ForEachThreatenedByMeOnOwner(evaluate))
+        return;
+
+    for (auto const& pair : _threatenedByMe)
+        evaluate(pair.second);
 }
 
 void ThreatManager::AddThreat(Unit* target, float amount, SpellInfo const* spell, bool ignoreModifiers, bool ignoreRedirects)
 {
+    MT_ASSERT_WRITABLE(_owner);
+
     // step 1: we can shortcut if the spell has one of the NO_THREAT attrs set - nothing will happen
     if (spell)
     {
@@ -398,6 +423,20 @@ void ThreatManager::AddThreat(Unit* target, float amount, SpellInfo const* spell
             return;
         if (!_owner->IsEngaged() && spell->HasAttribute(SPELL_ATTR3_SUPPRESS_TARGET_PROCS))
             return;
+    }
+
+    // threat links both units and puts both in combat: a target outside the running task's area is done on its owner
+    if (Map* map = _owner->FindMap(); map && !map->CanWriteNow(target))
+    {
+        map->RunOnOwner(target, [ownerGuid = _owner->GetGUID(), amount, spell, ignoreModifiers, ignoreRedirects](
+            WorldObject* deferredTarget)
+        {
+            Unit* targetUnit = deferredTarget->ToUnit();
+            Unit* owner = ObjectAccessor::GetUnit(*deferredTarget, ownerGuid);
+            if (targetUnit && owner)
+                owner->GetThreatMgr().AddThreat(targetUnit, amount, spell, ignoreModifiers, ignoreRedirects);
+        });
+        return;
     }
 
     // while riding a vehicle, all threat goes to the vehicle, not the pilot
@@ -777,34 +816,63 @@ void ThreatManager::ForwardThreatForAssistingMe(Unit* assistant, float baseAmoun
         return;
 
     std::vector<Creature*> canBeThreatened, cannotBeThreatened;
-    for (auto const& pair : _threatenedByMe)
     {
-        Creature* owner = pair.second->GetOwner();
-        if (!owner->HasUnitState(UNIT_STATE_CONTROLLED))
-            canBeThreatened.push_back(owner);
-        else
-            cannotBeThreatened.push_back(owner);
+        std::unique_lock<std::mutex> const lock = LockLinksIfNeeded(_owner);
+        for (auto const& pair : _threatenedByMe)
+        {
+            Creature* owner = pair.second->GetOwner();
+            if (!owner->HasUnitState(UNIT_STATE_CONTROLLED))
+                canBeThreatened.push_back(owner);
+            else
+                cannotBeThreatened.push_back(owner);
+        }
     }
+
+    // a threatened creature can be far from the assistant, in another task's area: its threat list is written there
+    Map* map = _owner->GetMap();
+    auto addThreat = [map, assistant, spell](Creature* threatened, float amount, bool noModifiers)
+    {
+        if (map->CanWriteNow(threatened))
+        {
+            threatened->GetThreatMgr().AddThreat(assistant, amount, spell, noModifiers);
+            return;
+        }
+
+        map->RunOnOwner(threatened, [assistantGuid = assistant->GetGUID(), amount, spell, noModifiers](
+            WorldObject* target)
+        {
+            Unit* threatenedUnit = target->ToUnit();
+            Unit* assistantUnit = ObjectAccessor::GetUnit(*target, assistantGuid);
+            if (threatenedUnit && assistantUnit)
+                threatenedUnit->GetThreatMgr().AddThreat(assistantUnit, amount, spell, noModifiers);
+        });
+    };
 
     if (!canBeThreatened.empty()) // targets under CC cannot gain assist threat - split evenly among the rest
     {
         float const perTarget = baseAmount / canBeThreatened.size();
         for (Creature* threatened : canBeThreatened)
-            threatened->GetThreatMgr().AddThreat(assistant, perTarget, spell, ignoreModifiers);
+            addThreat(threatened, perTarget, ignoreModifiers);
     }
 
     for (Creature* threatened : cannotBeThreatened)
-        threatened->GetThreatMgr().AddThreat(assistant, 0.0f, spell, true);
+        addThreat(threatened, 0.0f, true);
 }
 
 void ThreatManager::ResetAllMyThreatOnOthers()
 {
+    if (ForEachThreatenedByMeOnOwner([](ThreatReference* ref) { ref->ScaleThreat(0.0f); }))
+        return;
+
     for (auto const& pair : _threatenedByMe)
         pair.second->ScaleThreat(0.0f);
 }
 
 void ThreatManager::RemoveMeFromThreatLists()
 {
+    if (ForEachThreatenedByMeOnOwner([](ThreatReference* ref) { ref->ClearThreat(); }))
+        return;
+
     while (!_threatenedByMe.empty())
     {
         auto& ref = _threatenedByMe.begin()->second;
@@ -817,6 +885,18 @@ void ThreatManager::UpdateMyTempModifiers()
     int32 mod = 0;
     for (AuraEffect const* eff : _owner->GetAuraEffectsByType(SPELL_AURA_MOD_TOTAL_THREAT))
         mod += eff->GetAmount();
+
+    auto applyModifier = [mod](ThreatReference* ref)
+    {
+        bool const increase = (ref->_tempModifier < mod);
+        ref->_tempModifier = mod;
+        if (increase)
+            ref->HeapNotifyIncreased();
+        else
+            ref->HeapNotifyDecreased();
+    };
+    if (ForEachThreatenedByMeOnOwner(applyModifier))
+        return;
 
     if (_threatenedByMe.empty())
         return;
@@ -932,6 +1012,7 @@ void ThreatManager::PurgeThreatListRef(ObjectGuid const& guid)
 
 void ThreatManager::PutThreatenedByMeRef(ObjectGuid const& guid, ThreatReference* ref)
 {
+    std::lock_guard<std::mutex> lock(_owner->GetLinkLock());
     auto& inMap = _threatenedByMe[guid];
     ASSERT(!inMap, "Duplicate threatened-by-me reference at %p being inserted on %s for %s - memory leak!", (void*)ref, _owner->GetGUID().ToString().c_str(), guid.ToString().c_str());
     inMap = ref;
@@ -939,9 +1020,39 @@ void ThreatManager::PutThreatenedByMeRef(ObjectGuid const& guid, ThreatReference
 
 void ThreatManager::PurgeThreatenedByMeRef(ObjectGuid const& guid)
 {
+    std::lock_guard<std::mutex> lock(_owner->GetLinkLock());
     auto it = _threatenedByMe.find(guid);
     if (it != _threatenedByMe.end())
         _threatenedByMe.erase(it);
+}
+
+bool ThreatManager::ForEachThreatenedByMeOnOwner(std::function<void(ThreatReference*)> fn)
+{
+    if (!_owner->IsLinkLockNeeded())
+        return false;
+
+    std::vector<ObjectGuid> threatListOwners;
+    {
+        std::lock_guard<std::mutex> lock(_owner->GetLinkLock());
+        threatListOwners.reserve(_threatenedByMe.size());
+        for (auto const& pair : _threatenedByMe)
+            threatListOwners.push_back(pair.first);
+    }
+
+    Map* map = _owner->GetMap();
+    ObjectGuid const ownerGuid = _owner->GetGUID();
+    for (ObjectGuid const& threatListOwner : threatListOwners)
+        map->RunOnOwner(threatListOwner, [ownerGuid, fn](WorldObject* target)
+        {
+            Unit* unit = target->ToUnit();
+            if (!unit)
+                return;
+
+            auto const& entries = unit->GetThreatMgr()._myThreatListEntries;
+            if (ThreatReference* ref = Acore::Containers::MapGetValuePtr(entries, ownerGuid))
+                fn(ref);
+        });
+    return true;
 }
 
 void ThreatManager::UpdateRedirectInfo()

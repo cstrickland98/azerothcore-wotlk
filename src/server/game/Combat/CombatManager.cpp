@@ -27,6 +27,9 @@
 #include "Containers.h"
 #include "Creature.h"
 #include "CreatureAI.h"
+#include "Map.h"
+#include "MapThreading.h"
+#include "ObjectAccessor.h"
 #include "Player.h"
 #include "ScriptMgr.h"
 #include "ThreatManager.h"
@@ -213,6 +216,19 @@ Unit* CombatManager::GetAnyTarget() const
 
 bool CombatManager::SetInCombatWith(Unit* who, bool addSecondUnitSuppressed)
 {
+    // a combat reference writes both units: with a unit outside the running task's area it is made on that unit's owner
+    if (Map* map = _owner->FindMap(); map && !map->CanWriteNow(who))
+    {
+        map->RunOnOwner(who, [ownerGuid = _owner->GetGUID(), addSecondUnitSuppressed](WorldObject* target)
+        {
+            Unit* whoUnit = target->ToUnit();
+            Unit* owner = ObjectAccessor::GetUnit(*target, ownerGuid);
+            if (whoUnit && owner)
+                owner->GetCombatManager().SetInCombatWith(whoUnit, addSecondUnitSuppressed);
+        });
+        return IsInCombatWith(who);
+    }
+
     // Are we already in combat? If yes, refresh pvp combat
     if (PvPCombatReference* existingPvpRef = Acore::Containers::MapGetValuePtr(_pvpRefs, who->GetGUID()))
     {
@@ -385,6 +401,7 @@ void CombatManager::EndAllPvPCombat()
 
 void CombatManager::PutReference(ObjectGuid const& guid, CombatReference* ref)
 {
+    MT_ASSERT_WRITABLE(_owner);
     if (ref->_isPvP)
     {
         auto& inMap = _pvpRefs[guid];
@@ -401,6 +418,7 @@ void CombatManager::PutReference(ObjectGuid const& guid, CombatReference* ref)
 
 void CombatManager::PurgeReference(ObjectGuid const& guid, bool pvp)
 {
+    MT_ASSERT_WRITABLE(_owner);
     if (pvp)
         _pvpRefs.erase(guid);
     else

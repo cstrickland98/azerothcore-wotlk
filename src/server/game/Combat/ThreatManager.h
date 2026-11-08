@@ -225,6 +225,10 @@ private:
     ///== OTHERS' THREAT LISTS ==
     void PutThreatenedByMeRef(ObjectGuid const& guid, ThreatReference* ref);
     void PurgeThreatenedByMeRef(ObjectGuid const& guid);
+    // In a parallel map phase, runs fn on every reference to our owner on the thread allowed to write the
+    // reference's threat list (now or after the phase); returns false outside a phase, iterate directly then
+    bool ForEachThreatenedByMeOnOwner(std::function<void(ThreatReference*)> fn);
+    // written by other units' threat lists; guarded by the owner's link lock (Unit::GetLinkLock)
     std::unordered_map<ObjectGuid, ThreatReference*> _threatenedByMe;
     std::array<float, MAX_SPELL_SCHOOL> _singleSchoolModifiers;
     mutable std::unordered_map<std::underlying_type<SpellSchoolMask>::type, float> _multiSchoolModifiers;
