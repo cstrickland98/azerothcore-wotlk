@@ -22,6 +22,7 @@
 #include "BattlegroundQueue.h"
 #include "CreatureAIImpl.h"
 #include "DBCEnums.h"
+#include "SpinLock.h"
 #include <unordered_map>
 
 typedef std::map<uint32, Battleground*> BattlegroundContainer;
@@ -153,7 +154,8 @@ private:
 
     BattlegroundQueue m_BattlegroundQueues[MAX_BATTLEGROUND_QUEUE_TYPES];
 
-    std::vector<uint64> m_QueueUpdateScheduler;
+    std::vector<uint64> m_QueueUpdateScheduler;   // filled from map threads (a battleground losing a player), drained by Update
+    Acore::SpinLock m_QueueUpdateSchedulerLock;
     bool   m_ArenaTesting;
     bool   m_Testing;
     Seconds m_NextAutoDistributionTime;
