@@ -3014,6 +3014,19 @@ void GameObject::UpdateModelPosition()
     if (!m_model)
         return;
 
+    // In a parallel phase the tree removal is queued until the phase boundary, so the bounds would change while the
+    // model is still in the tree: move it in the serial step instead
+    if (GetMap()->IsParallelPhase())
+    {
+        ObjectGuid guid = GetGUID();
+        GetMap()->DeferToPhaseEnd([map = GetMap(), guid]()
+        {
+            if (GameObject* go = map->GetGameObject(guid))
+                go->UpdateModelPosition();
+        });
+        return;
+    }
+
     if (GetMap()->ContainsGameObjectModel(*m_model))
     {
         GetMap()->RemoveGameObjectModel(*m_model);
