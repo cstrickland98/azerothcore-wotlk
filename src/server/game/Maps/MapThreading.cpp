@@ -60,6 +60,11 @@ bool MapThreading::IsWritable(WorldObject const* obj)
     if (obj->FindMap() != context.map)
         return true;
 
+    // An object outside the world (being created, or already removed this tick) is reachable only through whoever
+    // holds its pointer; its position says nothing about which task may write it
+    if (!obj->IsInWorld())
+        return true;
+
     int32 gridX = 0;
     int32 gridY = 0;
     if (!Map::GetObjectGridCoord(obj, gridX, gridY))
