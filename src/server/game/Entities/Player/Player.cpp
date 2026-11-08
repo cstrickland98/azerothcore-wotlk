@@ -58,6 +58,7 @@
 #include "Log.h"
 #include "LootItemStorage.h"
 #include "MapMgr.h"
+#include "MapThreading.h"
 #include "MiscPackets.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
@@ -4795,6 +4796,20 @@ void Player::RemoveCorpse()
 
 void Player::SpawnCorpseBones(bool triggerSave /*= true*/)
 {
+    // From a grid task, a corpse the task does not own is converted in the serial step after the phase; the ghost
+    // flag save below depends on the conversion, so the whole operation moves there
+    if (MapThreading::InParallelPhase() && _corpseLocation.GetMapId() == GetMapId()
+        && !MapThreading::IsPositionWritable(_corpseLocation.GetPositionX(), _corpseLocation.GetPositionY()))
+    {
+        ObjectGuid guid = GetGUID();
+        GetMap()->DeferToPhaseEnd([guid, triggerSave]()
+        {
+            if (Player* player = ObjectAccessor::FindPlayer(guid))
+                player->SpawnCorpseBones(triggerSave);
+        });
+        return;
+    }
+
     _corpseLocation.WorldRelocate();
     if (GetMap()->ConvertCorpseToBones(GetGUID()))
         if (triggerSave && !GetSession()->PlayerLogoutWithSave())   // at logout we will already store the player
