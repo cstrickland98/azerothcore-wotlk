@@ -1877,6 +1877,7 @@ public:
     PvPInfo pvpInfo;
     void UpdatePvPState();
     void UpdateFFAPvPState(bool reset = true);
+    void SetControlledFFAPvPFlag(Unit* controlled, bool apply);
     void SetPvP(bool state);
     void UpdatePvP(bool state, bool _override = false);
     void UpdateZone(uint32 newZone, uint32 newArea, bool force = false);

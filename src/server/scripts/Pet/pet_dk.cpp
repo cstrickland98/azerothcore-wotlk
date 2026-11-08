@@ -20,6 +20,7 @@
 #include "CombatAI.h"
 #include "CreatureScript.h"
 #include "GridNotifiers.h"
+#include "Map.h"
 #include "PassiveAI.h"
 #include "ScriptedCreature.h"
 #include "SpellAuraEffects.h"
@@ -139,14 +140,34 @@ struct npc_pet_dk_ebon_gargoyle : ScriptedAI
     {
         RemoveTargetAura();
         _targetGUID = who->GetGUID();
-        me->AddAura(SPELL_DK_SUMMON_GARGOYLE_1, who);
+        // the gazed target can stand in a grid another map task owns: its aura is applied from there
+        if (me->GetMap()->CanWriteNow(who))
+            me->AddAura(SPELL_DK_SUMMON_GARGOYLE_1, who);
+        else
+            me->GetMap()->RunOnOwner(who, [gargoyleGuid = me->GetGUID()](WorldObject* target)
+            {
+                Unit* unit = target->ToUnit();
+                Creature* gargoyle = ObjectAccessor::GetCreature(*target, gargoyleGuid);
+                if (unit && gargoyle && gargoyle->GetVictim() == unit)
+                    gargoyle->AddAura(SPELL_DK_SUMMON_GARGOYLE_1, unit);
+            });
         ScriptedAI::AttackStartCaster(who, 40);
     }
 
     void RemoveTargetAura()
     {
-        if (Unit* target = ObjectAccessor::GetUnit(*me, _targetGUID))
+        Unit* target = ObjectAccessor::GetUnit(*me, _targetGUID);
+        if (!target)
+            return;
+
+        if (me->GetMap()->CanWriteNow(target))
             target->RemoveAura(SPELL_DK_SUMMON_GARGOYLE_1, me->GetGUID());
+        else
+            me->GetMap()->RunOnOwner(target, [casterGuid = me->GetGUID()](WorldObject* obj)
+            {
+                if (Unit* unit = obj->ToUnit())
+                    unit->RemoveAura(SPELL_DK_SUMMON_GARGOYLE_1, casterGuid);
+            });
     }
 
     void Reset() override
