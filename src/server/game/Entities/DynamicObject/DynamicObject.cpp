@@ -142,6 +142,24 @@ void DynamicObject::Update(uint32 p_time)
     ASSERT(_caster);
     ASSERT(_caster->GetMap() == GetMap());
 
+    // In a parallel phase of the map (MapUpdate.ThreadsPerMap > 1) this runs on the task owning the dynobj's grid,
+    // but the aura's periodic ticks and scripts act through the caster (GetCaster()->CastCustomSpell, the caster's
+    // visibility update), who may have walked into another task's grid. Then the whole update runs in the serial
+    // step after the phase, where everything is writable; the dynobj is looked up again there and skipped if it
+    // left the world meanwhile (a caster leaving the map or the world removes its dynobjs first, so the ASSERTs
+    // above still hold then).
+    if (GetMap()->IsParallelPhase() && !GetMap()->CanWriteNow(_caster))
+    {
+        Map* map = GetMap();
+        map->DeferToPhaseEnd([map, guid = GetGUID(), p_time]()
+        {
+            if (DynamicObject* dynObj = map->GetDynamicObject(guid))
+                if (dynObj->IsInWorld())
+                    dynObj->Update(p_time);
+        });
+        return;
+    }
+
     bool expired = false;
 
     if (_aura)
