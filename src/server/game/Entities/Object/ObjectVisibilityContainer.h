@@ -74,14 +74,7 @@ public:
     {
         ScratchBuffer<Player> scratch;
         std::vector<Player*>& players = scratch.Get();
-        {
-            std::lock_guard<Acore::SpinLock> guard(_lock);
-            // a corrupted map would be iterated forever here, allocating until memory runs out
-            ASSERT(_visiblePlayersMap.size() < 1000000, "ObjectVisibilityContainer: %zu visible players", _visiblePlayersMap.size());
-            players.reserve(_visiblePlayersMap.size());
-            for (auto const& kvPair : _visiblePlayersMap)
-                players.push_back(kvPair.second);
-        }
+        SnapshotVisiblePlayers(players);
 
         for (Player* player : players)
             worker(player);
@@ -94,22 +87,18 @@ public:
     {
         ScratchBuffer<WorldObject> scratch;
         std::vector<WorldObject*>& worldObjects = scratch.Get();
-        {
-            std::lock_guard<Acore::SpinLock> guard(_lock);
-            if (!_visibleWorldObjectsMap)
-                return;
-
-            ASSERT(_visibleWorldObjectsMap->size() < 1000000, "ObjectVisibilityContainer: %zu visible objects", _visibleWorldObjectsMap->size());
-            worldObjects.reserve(_visibleWorldObjectsMap->size());
-            for (auto const& kvPair : *_visibleWorldObjectsMap)
-                worldObjects.push_back(kvPair.second);
-        }
+        SnapshotVisibleWorldObjects(worldObjects);
 
         for (WorldObject* worldObject : worldObjects)
             worker(worldObject);
     }
 
 private:
+    // Copy the map's values under the lock. A map whose node chain was damaged by a stray write would be
+    // iterated forever here, allocating until memory runs out: both abort as soon as the copy outgrows size().
+    void SnapshotVisiblePlayers(std::vector<Player*>& out) const;
+    void SnapshotVisibleWorldObjects(std::vector<WorldObject*>& out) const;
+
     // Per-thread pool of snapshot vectors, so ForEach* does not allocate in steady state
     // and stays safe when a worker re-enters ForEach* (each nesting level takes its own vector).
     template<typename T>
