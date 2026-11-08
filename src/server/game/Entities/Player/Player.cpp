@@ -15758,18 +15758,10 @@ void Player::ActivateSpec(uint8 spec)
         RemoveAurasDueToSpell(25780);
 
     // Xinef: Remove talented single target auras at other targets
-    AuraList& scAuras = GetSingleCastAuras();
-    for (AuraList::iterator iter = scAuras.begin(); iter != scAuras.end();)
+    RemoveSingleCastAurasIf([this](Aura const* aura)
     {
-        Aura* aura = *iter;
-        if (!HasActiveSpell(aura->GetId()) && !HasTalent(aura->GetId(), GetActiveSpec()) && !aura->GetCastItemGUID())
-        {
-            aura->Remove();
-            iter = scAuras.begin();
-        }
-        else
-            ++iter;
-    }
+        return !HasActiveSpell(aura->GetId()) && !HasTalent(aura->GetId(), GetActiveSpec()) && !aura->GetCastItemGUID();
+    });
 
     // Recheck shapeshift bonus auras: drop and re-apply form-tied passives
     // so buffs from talents missing in the new spec (e.g. Master Shapeshifter) go away
