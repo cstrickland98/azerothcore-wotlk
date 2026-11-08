@@ -41,6 +41,8 @@ namespace MapThreading
     Context& Current();             // thread_local
     bool InParallelPhase();         // Current().map != nullptr
     bool IsWritable(WorldObject const* obj);
+    // Whether the running task owns the position: inside its grid, or within half a grid of it. True outside a phase.
+    bool IsPositionWritable(float x, float y);
     void ReportViolation(char const* site, WorldObject const* obj);   // logs the first few per site, counts the rest; never aborts
     std::string TakeViolationSummary(Map const* map);                 // "site=count, ..." for this map since the last call, busiest first
 }
