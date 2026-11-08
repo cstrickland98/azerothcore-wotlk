@@ -1502,6 +1502,32 @@ void Player::UpdatePvPState()
     }
 }
 
+// A controlled unit left far behind belongs to another map task right now: its flag is set from there
+void Player::SetControlledFFAPvPFlag(Unit* controlled, bool apply)
+{
+    Map* map = FindMap();
+    if (!map || map->CanWriteNow(controlled))
+    {
+        if (apply)
+            controlled->SetByteValue(UNIT_FIELD_BYTES_2, 1, UNIT_BYTE2_FLAG_FFA_PVP);
+        else
+            controlled->RemoveByteFlag(UNIT_FIELD_BYTES_2, 1, UNIT_BYTE2_FLAG_FFA_PVP);
+        return;
+    }
+
+    map->RunOnOwner(controlled, [ownerGuid = GetGUID(), apply](WorldObject* target)
+    {
+        Unit* unit = target->ToUnit();
+        if (!unit || unit->GetOwnerGUID() != ownerGuid)
+            return;
+
+        if (apply)
+            unit->SetByteValue(UNIT_FIELD_BYTES_2, 1, UNIT_BYTE2_FLAG_FFA_PVP);
+        else
+            unit->RemoveByteFlag(UNIT_FIELD_BYTES_2, 1, UNIT_BYTE2_FLAG_FFA_PVP);
+    });
+}
+
 void Player::UpdateFFAPvPState(bool reset /*= true*/)
 {
     /// @todo: should we always synchronize UNIT_FIELD_BYTES_2, 1 of controller
@@ -1514,10 +1540,8 @@ void Player::UpdateFFAPvPState(bool reset /*= true*/)
         {
             sScriptMgr->OnPlayerFfaPvpStateUpdate(this, true);
             SetByteFlag(UNIT_FIELD_BYTES_2, 1, UNIT_BYTE2_FLAG_FFA_PVP);
-            for (ControlSet::iterator itr = m_Controlled.begin();
-                 itr != m_Controlled.end(); ++itr)
-                (*itr)->SetByteValue(UNIT_FIELD_BYTES_2, 1,
-                                     UNIT_BYTE2_FLAG_FFA_PVP);
+            for (Unit* controlled : m_Controlled)
+                SetControlledFFAPvPFlag(controlled, true);
         }
 
         if (pvpInfo.IsInFFAPvPArea)
@@ -1536,10 +1560,8 @@ void Player::UpdateFFAPvPState(bool reset /*= true*/)
                 RemoveByteFlag(UNIT_FIELD_BYTES_2, 1, UNIT_BYTE2_FLAG_FFA_PVP);
                 sScriptMgr->OnPlayerFfaPvpStateUpdate(this, false);
             }
-            for (ControlSet::iterator itr = m_Controlled.begin();
-                 itr != m_Controlled.end(); ++itr)
-                (*itr)->RemoveByteFlag(UNIT_FIELD_BYTES_2, 1,
-                                       UNIT_BYTE2_FLAG_FFA_PVP);
+            for (Unit* controlled : m_Controlled)
+                SetControlledFFAPvPFlag(controlled, false);
 
             // xinef: iterate attackers
             AttackerSet        toRemove;
