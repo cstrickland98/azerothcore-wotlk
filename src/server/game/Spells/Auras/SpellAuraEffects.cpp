@@ -25,6 +25,7 @@
 #include "GameTime.h"
 #include "GridNotifiers.h"
 #include "Log.h"
+#include "Map.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
@@ -942,9 +943,19 @@ void AuraEffect::Update(uint32 diff, Unit* caster)
             std::list<AuraApplication*> effectApplications;
             GetApplicationList(effectApplications);
             // tick on targets of effects
-            for (std::list<AuraApplication*>::const_iterator apptItr = effectApplications.begin(); apptItr != effectApplications.end(); ++apptItr)
-                if ((*apptItr)->HasEffect(GetEffIndex()))
-                    PeriodicTick(*apptItr, caster);
+            for (AuraApplication* aurApp : effectApplications)
+            {
+                if (!aurApp->HasEffect(GetEffIndex()))
+                    continue;
+
+                // a target that left the owner's area this tick (teleported out of an area aura) belongs to
+                // another task now: it misses this tick and the next target map update drops it
+                Unit* target = aurApp->GetTarget();
+                if (Map* map = target->FindMap(); map && !map->CanWriteNow(target))
+                    continue;
+
+                PeriodicTick(aurApp, caster);
+            }
         }
     }
 }
