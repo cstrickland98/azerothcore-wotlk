@@ -2281,6 +2281,10 @@ private:
     void _addAttacker(Unit* pAttacker);    ///@note: Call only in Unit::Attack()
     void _removeAttacker(Unit* pAttacker); ///@note: Call only in Unit::AttackStop()
 
+    // The charmed unit's half of charmer->SetCharm(this, false): releases this unit from charmer. Returns false when the
+    // charmer keeps this unit in its controlled list (a pet or minion it owns).
+    bool ReleaseCharmedLink(Unit* charmer);
+
     //----------- Private variables ----------//
     uint32 m_state;                                     // Even derived shouldn't modify
     uint32 m_CombatTimer;

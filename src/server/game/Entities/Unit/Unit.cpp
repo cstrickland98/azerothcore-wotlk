@@ -8022,48 +8022,56 @@ void Unit::SetCharm(Unit* charm, bool apply)
     }
     else
     {
-        charm->ClearUnitState(UNIT_STATE_CHARMED);
-
         if (IsPlayer())
         {
             if (!RemoveGuidValue(UNIT_FIELD_CHARM, charm->GetGUID()))
                 LOG_FATAL("entities.unit", "Player {} is trying to uncharm unit {}, but it has another charmed unit {}", GetName(), charm->GetEntry(), GetCharmGUID().ToString());
         }
 
-        if (!charm->RemoveGuidValue(UNIT_FIELD_CHARMEDBY, GetGUID()))
-            LOG_FATAL("entities.unit", "Unit {} is being uncharmed, but it has another charmer {}", charm->GetEntry(), charm->GetCharmerGUID().ToString());
-
-        if (charm->IsPlayer())
-        {
-            charm->m_ControlledByPlayer = true;
-            charm->SetUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED);
-            charm->ToPlayer()->UpdatePvPState();
-        }
-        else if (Player* player = charm->GetCharmerOrOwnerPlayerOrPlayerItself())
-        {
-            charm->m_ControlledByPlayer = true;
-            charm->SetUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED);
-            charm->SetByteValue(UNIT_FIELD_BYTES_2, 1, player->GetByteValue(UNIT_FIELD_BYTES_2, 1));
-
-            // Xinef: skip controlled erase if charmed unit is owned by charmer
-            if (charm->IsInWorld() && !charm->IsDuringRemoveFromWorld() && player->GetGUID() == this->GetGUID() && (charm->IsPet() || charm->HasUnitTypeMask(UNIT_MASK_MINION)))
-                return;
-        }
-        else
-        {
-            charm->m_ControlledByPlayer = false;
-            charm->RemoveUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED);
-            charm->SetByteValue(UNIT_FIELD_BYTES_2, 1, 0);
-        }
-
-        if (charm->IsWalking() != _isWalkingBeforeCharm)
-        {
-            charm->SetWalk(_isWalkingBeforeCharm);
-            charm->SendMovementFlagUpdate(true); // send packet to self, to update movement state on player.
-        }
-
-        m_Controlled.erase(charm);
+        if (charm->ReleaseCharmedLink(this))
+            m_Controlled.erase(charm);
     }
+}
+
+bool Unit::ReleaseCharmedLink(Unit* charmer)
+{
+    MT_ASSERT_WRITABLE(this);
+
+    ClearUnitState(UNIT_STATE_CHARMED);
+
+    if (!RemoveGuidValue(UNIT_FIELD_CHARMEDBY, charmer->GetGUID()))
+        LOG_FATAL("entities.unit", "Unit {} is being uncharmed, but it has another charmer {}", GetEntry(), GetCharmerGUID().ToString());
+
+    if (IsPlayer())
+    {
+        m_ControlledByPlayer = true;
+        SetUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED);
+        ToPlayer()->UpdatePvPState();
+    }
+    else if (Player* player = GetCharmerOrOwnerPlayerOrPlayerItself())
+    {
+        m_ControlledByPlayer = true;
+        SetUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED);
+        SetByteValue(UNIT_FIELD_BYTES_2, 1, player->GetByteValue(UNIT_FIELD_BYTES_2, 1));
+
+        // Xinef: skip controlled erase if charmed unit is owned by charmer
+        if (IsInWorld() && !IsDuringRemoveFromWorld() && player->GetGUID() == charmer->GetGUID() && (IsPet() || HasUnitTypeMask(UNIT_MASK_MINION)))
+            return false;
+    }
+    else
+    {
+        m_ControlledByPlayer = false;
+        RemoveUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED);
+        SetByteValue(UNIT_FIELD_BYTES_2, 1, 0);
+    }
+
+    if (IsWalking() != charmer->_isWalkingBeforeCharm)
+    {
+        SetWalk(charmer->_isWalkingBeforeCharm);
+        SendMovementFlagUpdate(true); // send packet to self, to update movement state on player.
+    }
+
+    return true;
 }
 
 int32 Unit::DealHeal(Unit* healer, Unit* victim, uint32 addhealth)
@@ -14280,7 +14288,10 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
     killMap->RunOnOwner(farKiller->GetGUID(), [deferredStages, killerGuid, playerGuid, victimGuid = victim->GetGUID()](
         WorldObject* target)
     {
-        Unit* deferredVictim = ObjectAccessor::GetUnit(*target, victimGuid);
+        // the map's lookup also finds a victim removed from the world during the phase (a summon unsummoned on death),
+        // which stays valid until the map's delayed update
+        WorldObject* victimObject = target->GetMap()->FindObjectForDeferredOp(victimGuid);
+        Unit* deferredVictim = victimObject ? victimObject->ToUnit() : nullptr;
         if (!deferredVictim)
         {
             LOG_DEBUG("maps.threading", "Unit::Kill: victim {} gone before its far killer's side ran",
@@ -14868,41 +14879,46 @@ void Unit::RemoveCharmedBy(Unit* charmer)
     if (type != CHARM_TYPE_VEHICLE)
         LastCharmerGUID = charmer->GetGUID();
 
-    // The charm aura ends on the charmed unit's thread, the charmer can be far, in another task's area: the charmer's
-    // half (charm link, client control, control bar) runs on the charmer's owner; until then this unit stays linked,
-    // so a removal from the world in between still ends the charm in full.
+    // The charm aura ends on the charmed unit's thread, the charmer can be far, in another task's area: this unit's
+    // half of the link (CHARMEDBY, charmed state, flags) is released now, so it can leave the world cleanly before the
+    // serial step; the charmer's half (CHARM field, controlled list, client control, control bar) runs on its owner.
     Map* charmMap = GetMap();
     bool const farCharmer = !charmMap->CanWriteNow(charmer);
     if (farCharmer)
-        charmMap->RunOnOwner(charmer, [charmGuid = GetGUID(), type](WorldObject* target)
+    {
+        bool const eraseControlled = ReleaseCharmedLink(charmer);
+        // controlledKey is only compared against m_Controlled entries, never dereferenced: this unit can be gone
+        // from every store by the time the charmer's half runs
+        charmMap->RunOnOwner(charmer, [charmGuid = GetGUID(), controlledKey = this, type, eraseControlled](WorldObject* target)
         {
             Unit* deferredCharmer = target->ToUnit();
             if (!deferredCharmer)
                 return;
 
-            Unit* charm = ObjectAccessor::GetUnit(*target, charmGuid);
-            if (!charm || charm->GetCharmerGUID() != deferredCharmer->GetGUID())
-            {
-                // the charm already ended in full (removal from the world) or the unit is gone
-                if (Player* playerCharmer = deferredCharmer->ToPlayer())
-                    playerCharmer->RemoveGuidValue(UNIT_FIELD_CHARM, charmGuid);
-                return;
-            }
+            Player* playerCharmer = deferredCharmer->ToPlayer();
+            if (playerCharmer && playerCharmer->GetCharmGUID() == charmGuid)
+                playerCharmer->RemoveGuidValue(UNIT_FIELD_CHARM, charmGuid);
 
-            deferredCharmer->SetCharm(charm, false);
-            if (Player* playerCharmer = deferredCharmer->ToPlayer())
+            if (eraseControlled)
+                deferredCharmer->m_Controlled.erase(controlledKey);
+
+            if (!playerCharmer)
+                return;
+
+            WorldObject* charmObject = deferredCharmer->GetMap()->FindObjectForDeferredOp(charmGuid);
+            Unit* charm = charmObject ? charmObject->ToUnit() : nullptr;
+            if (type == CHARM_TYPE_VEHICLE || type == CHARM_TYPE_POSSESS)
             {
-                if (type == CHARM_TYPE_VEHICLE || type == CHARM_TYPE_POSSESS)
-                {
+                if (charm)
                     playerCharmer->SetClientControl(charm, false);
-                    playerCharmer->SetClientControl(deferredCharmer, true); // verified
-                }
-                if (type == CHARM_TYPE_POSSESS)
-                    deferredCharmer->RemoveUnitFlag(UNIT_FLAG_DISABLE_MOVE);
-                if (charm != deferredCharmer->GetFirstControlled())
-                    playerCharmer->SendRemoveControlBar();
+                playerCharmer->SetClientControl(deferredCharmer, true); // verified
             }
+            if (type == CHARM_TYPE_POSSESS)
+                deferredCharmer->RemoveUnitFlag(UNIT_FLAG_DISABLE_MOVE);
+            if (!charm || charm != deferredCharmer->GetFirstControlled())
+                playerCharmer->SendRemoveControlBar();
         });
+    }
     else
         charmer->SetCharm(this, false);
 
