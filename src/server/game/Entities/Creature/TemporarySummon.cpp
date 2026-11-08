@@ -355,8 +355,23 @@ void TempSummon::RemoveFromWorld()
     if (m_Properties)
         if (uint32 slot = m_Properties->Slot)
             if (Unit* owner = GetSummonerUnit())
-                if (owner->m_SummonSlot[slot] == GetGUID())
-                    owner->m_SummonSlot[slot].Clear();
+            {
+                auto clearSlot = [slot, summonGuid = GetGUID()](Unit* summoner)
+                {
+                    if (summoner->m_SummonSlot[slot] == summonGuid)
+                        summoner->m_SummonSlot[slot].Clear();
+                };
+
+                // the summoner can be far, in another task's area: its slot is cleared on its owner
+                if (GetMap()->CanWriteNow(owner))
+                    clearSlot(owner);
+                else
+                    GetMap()->RunOnOwner(owner, [clearSlot](WorldObject* target)
+                    {
+                        if (Unit* summoner = target->ToUnit())
+                            clearSlot(summoner);
+                    });
+            }
 
     //if (GetOwnerGUID())
     //    LOG_ERROR("entities.unit", "Unit {} has owner guid when removed from world", GetEntry());
@@ -401,7 +416,19 @@ void Minion::RemoveFromWorld()
         return;
 
     if (Unit* owner = GetOwner())
-        owner->SetMinion(this, false);
+    {
+        // the owner can be far, in another task's area (it walked away from its totem): its minion bookkeeping
+        // (m_Controlled, pet/critter guids, UNIT_FIELD_SUMMON, client packets) is updated on its owner. SetMinion
+        // only reads this minion, which stays allocated until the remove list is processed after the serial step.
+        if (GetMap()->CanWriteNow(owner))
+            owner->SetMinion(this, false);
+        else
+            GetMap()->RunOnOwner(owner, [this](WorldObject* target)
+            {
+                if (Unit* minionOwner = target->ToUnit())
+                    minionOwner->SetMinion(this, false);
+            });
+    }
 
     TempSummon::RemoveFromWorld();
 }
