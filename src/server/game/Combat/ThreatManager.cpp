@@ -414,8 +414,6 @@ void ThreatManager::EvaluateSuppressed(bool canExpire)
 
 void ThreatManager::AddThreat(Unit* target, float amount, SpellInfo const* spell, bool ignoreModifiers, bool ignoreRedirects)
 {
-    MT_ASSERT_WRITABLE(_owner);
-
     // step 1: we can shortcut if the spell has one of the NO_THREAT attrs set - nothing will happen
     if (spell)
     {
@@ -425,8 +423,22 @@ void ThreatManager::AddThreat(Unit* target, float amount, SpellInfo const* spell
             return;
     }
 
-    // threat links both units and puts both in combat: a target outside the running task's area is done on its owner
-    if (Map* map = _owner->FindMap(); map && !map->CanWriteNow(target))
+    // threat links both units and puts both in combat: with this unit outside the running task's area it is done on
+    // this unit's owner, with the target outside it on the target's owner
+    Map* map = _owner->FindMap();
+    if (map && !map->CanWriteNow(_owner))
+    {
+        map->RunOnOwner(_owner, [targetGuid = target->GetGUID(), amount, spell, ignoreModifiers, ignoreRedirects](
+            WorldObject* deferredOwner)
+        {
+            Unit* owner = deferredOwner->ToUnit();
+            Unit* targetUnit = ObjectAccessor::GetUnit(*deferredOwner, targetGuid);
+            if (owner && targetUnit)
+                owner->GetThreatMgr().AddThreat(targetUnit, amount, spell, ignoreModifiers, ignoreRedirects);
+        });
+        return;
+    }
+    if (map && !map->CanWriteNow(target))
     {
         map->RunOnOwner(target, [ownerGuid = _owner->GetGUID(), amount, spell, ignoreModifiers, ignoreRedirects](
             WorldObject* deferredTarget)
