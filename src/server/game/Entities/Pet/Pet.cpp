@@ -687,13 +687,32 @@ void Pet::Update(uint32 diff)
     if (m_loading)
         return;
 
+    // removing the pet writes its owner, who can be far, in another task's area: then it is removed on the owner
+    auto removePet = [this](PetSaveMode mode, bool returnReagent)
+    {
+        Player* owner = GetOwner();
+        if (!owner || GetMap()->CanWriteNow(owner))
+        {
+            Remove(mode, returnReagent);
+            return;
+        }
+
+        GetMap()->RunOnOwner(owner, [petGuid = GetGUID(), mode, returnReagent](WorldObject* target)
+        {
+            if (Player* player = target->ToPlayer())
+                if (Pet* pet = player->GetPet(); pet && pet->GetGUID() == petGuid && !pet->m_removed)
+                    pet->Remove(mode, returnReagent);
+        });
+    };
+
     switch (m_deathState)
     {
         case DeathState::Corpse:
             {
                 if (getPetType() != HUNTER_PET || m_corpseRemoveTime <= GameTime::GetGameTime().count())
                 {
-                    Remove(PET_SAVE_NOT_IN_SLOT);               //hunters' pets never get removed because of death, NEVER!
+                    //hunters' pets never get removed because of death, NEVER!
+                    removePet(PET_SAVE_NOT_IN_SLOT, false);
                     return;
                 }
                 break;
@@ -705,7 +724,7 @@ void Pet::Update(uint32 diff)
                 if (!owner || (!IsWithinDistInMap(owner, GetMap()->GetVisibilityRange()) && !isPossessed()) || (isControlled() && !owner->GetPetGUID()))
                     //if (!owner || (!IsWithinDistInMap(owner, GetMap()->GetVisibilityDistance()) && (owner->GetCharmGUID() && (owner->GetCharmGUID() != GetGUID()))) || (isControlled() && !owner->GetPetGUID()))
                 {
-                    Remove(PET_SAVE_NOT_IN_SLOT, true);
+                    removePet(PET_SAVE_NOT_IN_SLOT, true);
                     return;
                 }
 
@@ -715,7 +734,7 @@ void Pet::Update(uint32 diff)
                     {
                         LOG_ERROR("entities.pet", "Pet {} is not pet of owner {}, removed", GetEntry(), GetOwner()->GetName());
                         ASSERT(getPetType() != HUNTER_PET, "Unexpected unlinked pet found for owner {}", owner->GetSession()->GetPlayerInfo());
-                        Remove(PET_SAVE_NOT_IN_SLOT);
+                        removePet(PET_SAVE_NOT_IN_SLOT, false);
                         return;
                     }
                 }
@@ -726,7 +745,7 @@ void Pet::Update(uint32 diff)
                         m_duration -= _diff;
                     else
                     {
-                        Remove(getPetType() != SUMMON_PET ? PET_SAVE_AS_DELETED : PET_SAVE_NOT_IN_SLOT);
+                        removePet(getPetType() != SUMMON_PET ? PET_SAVE_AS_DELETED : PET_SAVE_NOT_IN_SLOT, false);
                         return;
                     }
                 }
