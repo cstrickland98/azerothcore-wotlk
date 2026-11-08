@@ -1057,10 +1057,24 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
     // Signal to pets that their owner was attacked - except when DOT.
     if (attacker != victim && damagetype != DOT && !skipCombat)
     {
+        // a pet can be far from its owner, in another task's area: its AI reacts (and attacks) on its owner
+        Map* petMap = victim->FindMap();
         for (Unit* controlled : victim->m_Controlled)
             if (Creature* cControlled = controlled->ToCreature())
                 if (CreatureAI* controlledAI = cControlled->AI())
-                    controlledAI->OwnerAttackedBy(attacker);
+                {
+                    if (!petMap || petMap->CanWriteNow(cControlled))
+                        controlledAI->OwnerAttackedBy(attacker);
+                    else
+                        petMap->RunOnOwner(cControlled, [attackerGuid = attacker ? attacker->GetGUID() : ObjectGuid::Empty](WorldObject* target)
+                        {
+                            Creature* pet = target->ToCreature();
+                            if (!pet || !pet->IsInWorld() || !pet->AI())
+                                return;
+
+                            pet->AI()->OwnerAttackedBy(attackerGuid ? ObjectAccessor::GetUnit(*pet, attackerGuid) : nullptr);
+                        });
+                }
     }
 
     //Dont deal damage to unit if .cheat god is enable.
@@ -11629,11 +11643,32 @@ void Unit::AtTargetAttacked(Unit* target, bool canInitialAggro)
             cTarget->UpdateLeashExtensionTime();
     }
 
-    target->EngageWithTarget(this);
+    // Engaging writes both units (combat references, threat lists). Either owner can be far, in another task's
+    // area (a pet fighting away from its master): then the pair is engaged in the serial step, where every
+    // object is writable
+    Map* map = FindMap();
+    auto engage = [map](Unit* who, Unit* with)
+    {
+        if (!map || (map->CanWriteNow(who) && map->CanWriteNow(with)))
+        {
+            who->EngageWithTarget(with);
+            return;
+        }
+
+        map->RunOnOwner(map->CanWriteNow(who) ? with : who, [whoGuid = who->GetGUID(), withGuid = with->GetGUID()](WorldObject* target)
+        {
+            Unit* deferredWho = ObjectAccessor::GetUnit(*target, whoGuid);
+            Unit* deferredWith = ObjectAccessor::GetUnit(*target, withGuid);
+            if (deferredWho && deferredWith && deferredWho->IsInWorld() && deferredWith->IsInWorld())
+                deferredWho->EngageWithTarget(deferredWith);
+        });
+    };
+
+    engage(target, this);
     if (Unit* targetOwner = target->GetCharmerOrOwner())
-        targetOwner->EngageWithTarget(this);
+        engage(targetOwner, this);
     if (Unit* myOwner = GetCharmerOrOwner())
-        target->EngageWithTarget(myOwner);
+        engage(target, myOwner);
 
     // Patch 3.0.8: All player spells which cause a creature to become aggressive
     // to you will now also immediately cause the creature to be tapped.
@@ -11645,9 +11680,23 @@ void Unit::AtTargetAttacked(Unit* target, bool canInitialAggro)
     Player* targetPlayerOwner = target->GetCharmerOrOwnerPlayerOrPlayerItself();
     if (myPlayerOwner && targetPlayerOwner && !(myPlayerOwner->duel && myPlayerOwner->duel->Opponent == targetPlayerOwner))
     {
-        myPlayerOwner->UpdatePvP(true);
-        myPlayerOwner->SetContestedPvP(targetPlayerOwner);
-        myPlayerOwner->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_ENTER_PVP_COMBAT);
+        // only my owner is written here (the attacked player is read); my owner can be far from its pet
+        auto enterPvP = [](Player* me, Player* attacked)
+        {
+            me->UpdatePvP(true);
+            me->SetContestedPvP(attacked);
+            me->RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_ENTER_PVP_COMBAT);
+        };
+
+        if (!map || map->CanWriteNow(myPlayerOwner))
+            enterPvP(myPlayerOwner, targetPlayerOwner);
+        else
+            map->RunOnOwner(myPlayerOwner, [attackedGuid = targetPlayerOwner->GetGUID(), enterPvP](WorldObject* target)
+            {
+                Player* me = target->ToPlayer();
+                if (me && me->IsInWorld())
+                    enterPvP(me, ObjectAccessor::GetPlayer(*me, attackedGuid));
+            });
     }
 }
 
