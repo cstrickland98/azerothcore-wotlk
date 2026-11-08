@@ -532,7 +532,18 @@ bool CombatManager::UpdateOwnerCombatState() const
     }
 
     if (Unit* master = _owner->GetCharmerOrOwner())
-        master->UpdatePetCombatState();
+    {
+        // the charmer/owner can be far, in another task's area: its pet-in-combat flag is recomputed on its owner
+        Map* map = _owner->FindMap();
+        if (!map || map->CanWriteNow(master))
+            master->UpdatePetCombatState();
+        else
+            map->RunOnOwner(master, [](WorldObject* target)
+            {
+                if (Unit* unit = target->ToUnit(); unit && !unit->IsPet())
+                    unit->UpdatePetCombatState();
+            });
+    }
 
     return true;
 }
@@ -550,8 +561,19 @@ void CombatManager::SetEvadeState(EvadeState state)
     // Propagate evade state to controlled units (pets, guardians, etc.)
     if (!_owner->HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED))
     {
+        // a controlled unit can be far, in another task's area: its evade state is set on its owner
+        Map* map = _owner->FindMap();
         for (Unit* controlled : _owner->m_Controlled)
-            controlled->GetCombatManager().SetEvadeState(state);
+        {
+            if (!map || map->CanWriteNow(controlled))
+                controlled->GetCombatManager().SetEvadeState(state);
+            else
+                map->RunOnOwner(controlled, [state](WorldObject* target)
+                {
+                    if (Unit* unit = target->ToUnit())
+                        unit->GetCombatManager().SetEvadeState(state);
+                });
+        }
     }
 }
 
