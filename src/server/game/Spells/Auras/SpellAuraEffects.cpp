@@ -3849,7 +3849,11 @@ void AuraEffect::HandleModPossessPet(AuraApplication const* aurApp, uint8 mode, 
         else
         {
             // Reinitialize the pet bar or it will appear greyed out
-            caster->ToPlayer()->PetSpellInitialize();
+            RunOnCaster(target, caster, [](Unit* owner, Unit* /*pet*/)
+            {
+                if (Player* player = owner->ToPlayer())
+                    player->PetSpellInitialize();
+            });
 
             // Follow owner only if not fighting or owner didn't click "stay" at new location
             // This may be confusing because pet bar shows "stay" when under the spell but it retains
@@ -5788,10 +5792,21 @@ void AuraEffect::HandleBindSight(AuraApplication const* aurApp, uint8 mode, bool
     if (!caster || !caster->IsPlayer())
         return;
 
-    caster->ToPlayer()->SetViewpoint(target, apply);
+    // the caster can be far from the unit it sees through; by GUID, the removal still resets a target that is gone
+    if (target->GetMap()->CanWriteNow(caster))
+    {
+        caster->ToPlayer()->SetViewpoint(target, apply);
+        return;
+    }
+
+    target->GetMap()->RunOnOwner(caster, [targetGuid = target->GetGUID(), apply](WorldObject* obj)
+    {
+        if (Player* player = obj->ToPlayer())
+            player->SetViewpoint(targetGuid, apply);
+    });
 }
 
-void AuraEffect::HandleFarSight(AuraApplication const* /*aurApp*/, uint8 mode, bool apply) const
+void AuraEffect::HandleFarSight(AuraApplication const* aurApp, uint8 mode, bool apply) const
 {
     if (!(mode & AURA_EFFECT_HANDLE_REAL))
     {
@@ -5804,17 +5819,29 @@ void AuraEffect::HandleFarSight(AuraApplication const* /*aurApp*/, uint8 mode, b
         return;
     }
 
-    Player* player = caster->ToPlayer();
-    if (apply)
+    auto farSight = [apply, range = m_spellInfo->GetMaxRange()](WorldObject* obj)
     {
-        player->SetFarSightDistance(m_spellInfo->GetMaxRange());
-    }
-    else
-    {
-        player->ResetFarSightDistance();
-    }
+        Player* player = obj->ToPlayer();
+        if (!player)
+            return;
 
-    caster->UpdateObjectVisibility(!apply);
+        if (apply)
+        {
+            player->SetFarSightDistance(range);
+        }
+        else
+        {
+            player->ResetFarSightDistance();
+        }
+
+        player->UpdateObjectVisibility(!apply);
+    };
+
+    Map* map = aurApp->GetTarget()->GetMap();
+    if (map->CanWriteNow(caster))
+        farSight(caster);
+    else
+        map->RunOnOwner(caster, farSight);
 }
 
 void AuraEffect::HandleForceReaction(AuraApplication const* aurApp, uint8 mode, bool apply) const
