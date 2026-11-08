@@ -2212,13 +2212,13 @@ void WorldObject::SendMessageToSet(WorldPacket const* data, bool self) const
 void WorldObject::SendMessageToSetInRange(WorldPacket const* data, float dist, bool /*self*/) const
 {
     Acore::MessageDistDeliverer notifier(this, data, dist);
-    notifier.Visit(GetObjectVisibilityContainer().GetVisiblePlayersMap());
+    GetObjectVisibilityContainer().ForEachVisiblePlayer([&notifier](Player const* target) { notifier.VisitVisiblePlayer(target); });
 }
 
 void WorldObject::SendMessageToSet(WorldPacket const* data, Player const* skipped_rcvr) const
 {
     Acore::MessageDistDeliverer notifier(this, data, 0.0f, Acore::TeamFilter::All, skipped_rcvr);
-    notifier.Visit(GetObjectVisibilityContainer().GetVisiblePlayersMap());
+    GetObjectVisibilityContainer().ForEachVisiblePlayer([&notifier](Player const* target) { notifier.VisitVisiblePlayer(target); });
 }
 
 void WorldObject::SendObjectDeSpawnAnim(ObjectGuid guid)
@@ -3092,16 +3092,13 @@ void WorldObject::DestroyForVisiblePlayers()
     if (!IsInWorld())
         return;
 
-    VisiblePlayersMap& visiblePlayerMap = GetObjectVisibilityContainer().GetVisiblePlayersMap();
-    for (VisiblePlayersMap::iterator itr = visiblePlayerMap.begin(); itr != visiblePlayerMap.end();)
+    GetObjectVisibilityContainer().ForEachVisiblePlayer([this](Player* player)
     {
-        Player* player = itr->second;
-
         DestroyForPlayer(player);
 
         // Clean up visibility references now
-        itr = GetObjectVisibilityContainer().UnlinkVisibilityFromWorldObject(player, itr);
-    }
+        GetObjectVisibilityContainer().UnlinkVisiblePlayer(player);
+    });
 }
 
 void WorldObject::UpdateObjectVisibility(bool /*forced*/, bool /*fromUpdate*/)

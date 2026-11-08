@@ -127,7 +127,7 @@ namespace Acore
             required3dDist(req3dDist)
         { }
 
-        void Visit(VisiblePlayersMap const& m);
+        void VisitVisiblePlayer(Player const* target) const;
         void Visit(PlayerMapType& m);
         void Visit(CreatureMapType& m);
         void Visit(DynamicObjectMapType& m);

@@ -5886,7 +5886,7 @@ void Player::SendMessageToSetInRange(WorldPacket const* data, float dist, bool s
         SendDirectMessage(data);
 
     Acore::MessageDistDeliverer notifier(this, data, dist);
-    notifier.Visit(GetObjectVisibilityContainer().GetVisiblePlayersMap());
+    GetObjectVisibilityContainer().ForEachVisiblePlayer([&notifier](Player const* target) { notifier.VisitVisiblePlayer(target); });
 }
 
 void Player::SendMessageToSet(WorldPacket const* data, Player const* skipped_rcvr) const
@@ -5895,7 +5895,7 @@ void Player::SendMessageToSet(WorldPacket const* data, Player const* skipped_rcv
         SendDirectMessage(data);
 
     Acore::MessageDistDeliverer notifier(this, data, 0.0f, Acore::TeamFilter::All, skipped_rcvr);
-    notifier.Visit(GetObjectVisibilityContainer().GetVisiblePlayersMap());
+    GetObjectVisibilityContainer().ForEachVisiblePlayer([&notifier](Player const* target) { notifier.VisitVisiblePlayer(target); });
 }
 
 void Player::SendDirectMessage(WorldPacket const* data) const
@@ -7933,7 +7933,7 @@ bool Player::CheckAmmoCompatibility(ItemTemplate const* ammo_proto) const
 
 void Player::SendQuestGiverStatusMultiple()
 {
-    if (GetObjectVisibilityContainer().GetVisibleWorldObjectsMap()->empty())
+    if (!GetObjectVisibilityContainer().HasVisibleWorldObjects())
         return;
 
     uint32 count = 0;
@@ -11646,7 +11646,7 @@ bool Player::HaveAtClient(ObjectGuid guid) const
     if (guid == GetGUID())
         return true;
 
-    return GetObjectVisibilityContainer().GetVisibleWorldObjectsMap()->find(guid) != GetObjectVisibilityContainer().GetVisibleWorldObjectsMap()->end();
+    return GetObjectVisibilityContainer().IsWorldObjectVisible(guid);
 }
 
 bool Player::IsNeverVisible() const

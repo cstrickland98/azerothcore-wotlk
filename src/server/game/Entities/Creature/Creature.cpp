@@ -4002,7 +4002,7 @@ bool Creature::IsUpdateNeeded()
     if (IsInCombat())
         return true;
 
-    if (!GetObjectVisibilityContainer().GetVisiblePlayersMap().empty())
+    if (GetObjectVisibilityContainer().HasVisiblePlayers())
         return true;
 
     if (ToTempSummon())

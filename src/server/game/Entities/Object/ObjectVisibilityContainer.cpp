@@ -46,18 +46,23 @@ void ObjectVisibilityContainer::InitForPlayer()
 
 void ObjectVisibilityContainer::CleanVisibilityReferences()
 {
-    for (auto const& kvPair : _visiblePlayersMap)
-        kvPair.second->GetObjectVisibilityContainer().DirectRemoveVisibilityReference(_selfObject->GetGUID());
-
-    if (_visibleWorldObjectsMap)
+    // Take our references out under the lock, then clean the other containers without holding it
+    VisiblePlayersMap visiblePlayers;
+    VisibleWorldObjectsMap visibleWorldObjects;
     {
-        for (auto const& kvPair : *_visibleWorldObjectsMap)
-            kvPair.second->GetObjectVisibilityContainer().DirectRemoveVisiblePlayerReference(_selfObject->GetGUID());
-
-        (*_visibleWorldObjectsMap).clear();
+        std::lock_guard<Acore::SpinLock> guard(_lock);
+        visiblePlayers.swap(_visiblePlayersMap);
+        if (_visibleWorldObjectsMap)
+            visibleWorldObjects.swap(*_visibleWorldObjectsMap);
     }
 
-    _visiblePlayersMap.clear();
+    ObjectGuid const selfGuid = _selfObject->GetGUID();
+
+    for (auto const& kvPair : visiblePlayers)
+        kvPair.second->GetObjectVisibilityContainer().DirectRemoveVisibilityReference(selfGuid);
+
+    for (auto const& kvPair : visibleWorldObjects)
+        kvPair.second->GetObjectVisibilityContainer().DirectRemoveVisiblePlayerReference(selfGuid);
 }
 
 void ObjectVisibilityContainer::LinkWorldObjectVisibility(WorldObject* worldObject)
@@ -70,49 +75,74 @@ void ObjectVisibilityContainer::LinkWorldObjectVisibility(WorldObject* worldObje
     if (worldObject->IsGameObject() && worldObject->ToGameObject()->IsTransport())
         return;
 
-    // Only players can link visibility
-    if (!_visibleWorldObjectsMap)
-        return;
+    {
+        std::lock_guard<Acore::SpinLock> guard(_lock);
 
-    (*_visibleWorldObjectsMap).insert(std::make_pair(worldObject->GetGUID(), worldObject));
+        // Only players can link visibility
+        if (!_visibleWorldObjectsMap)
+            return;
+
+        _visibleWorldObjectsMap->insert(std::make_pair(worldObject->GetGUID(), worldObject));
+    }
+
     worldObject->GetObjectVisibilityContainer().DirectInsertVisiblePlayerReference(_selfObject->ToPlayer());
 }
 
 void ObjectVisibilityContainer::UnlinkWorldObjectVisibility(WorldObject* worldObject)
 {
-    // Only players can unlink visibility
+    // Only players can unlink visibility (set once at construction time, no lock needed for the check)
     if (!_visibleWorldObjectsMap)
         return;
 
     worldObject->GetObjectVisibilityContainer().DirectRemoveVisiblePlayerReference(_selfObject->GetGUID());
-    (*_visibleWorldObjectsMap).erase(worldObject->GetGUID());
+
+    std::lock_guard<Acore::SpinLock> guard(_lock);
+    _visibleWorldObjectsMap->erase(worldObject->GetGUID());
 }
 
-VisibleWorldObjectsMap::iterator ObjectVisibilityContainer::UnlinkVisibilityFromPlayer(WorldObject* worldObject, VisibleWorldObjectsMap::iterator itr)
+void ObjectVisibilityContainer::UnlinkVisiblePlayer(Player* player)
 {
-    ASSERT(_visibleWorldObjectsMap); // Ensure we aren't for some reason calling this as a non-player object
-    worldObject->GetObjectVisibilityContainer().DirectRemoveVisiblePlayerReference(_selfObject->GetGUID());
-    return (*_visibleWorldObjectsMap).erase(itr);
-}
+    {
+        std::lock_guard<Acore::SpinLock> guard(_lock);
+        _visiblePlayersMap.erase(player->GetGUID());
+    }
 
-VisiblePlayersMap::iterator ObjectVisibilityContainer::UnlinkVisibilityFromWorldObject(Player* player, VisiblePlayersMap::iterator itr)
-{
     player->GetObjectVisibilityContainer().DirectRemoveVisibilityReference(_selfObject->GetGUID());
-    return _visiblePlayersMap.erase(itr);
+}
+
+bool ObjectVisibilityContainer::HasVisiblePlayers() const
+{
+    std::lock_guard<Acore::SpinLock> guard(_lock);
+    return !_visiblePlayersMap.empty();
+}
+
+bool ObjectVisibilityContainer::HasVisibleWorldObjects() const
+{
+    std::lock_guard<Acore::SpinLock> guard(_lock);
+    return _visibleWorldObjectsMap && !_visibleWorldObjectsMap->empty();
+}
+
+bool ObjectVisibilityContainer::IsWorldObjectVisible(ObjectGuid guid) const
+{
+    std::lock_guard<Acore::SpinLock> guard(_lock);
+    return _visibleWorldObjectsMap && _visibleWorldObjectsMap->find(guid) != _visibleWorldObjectsMap->end();
 }
 
 void ObjectVisibilityContainer::DirectRemoveVisibilityReference(ObjectGuid guid)
 {
     ASSERT(_visibleWorldObjectsMap);
-    (*_visibleWorldObjectsMap).erase(guid);
+    std::lock_guard<Acore::SpinLock> guard(_lock);
+    _visibleWorldObjectsMap->erase(guid);
 }
 
 void ObjectVisibilityContainer::DirectInsertVisiblePlayerReference(Player* player)
 {
+    std::lock_guard<Acore::SpinLock> guard(_lock);
     _visiblePlayersMap.insert(std::make_pair(player->GetGUID(), player));
 }
 
 void ObjectVisibilityContainer::DirectRemoveVisiblePlayerReference(ObjectGuid guid)
 {
+    std::lock_guard<Acore::SpinLock> guard(_lock);
     _visiblePlayersMap.erase(guid);
 }

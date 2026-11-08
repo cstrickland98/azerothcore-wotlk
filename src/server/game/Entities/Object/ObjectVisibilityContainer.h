@@ -20,8 +20,12 @@
 
 #include "Common.h"
 #include "ObjectGuid.h"
+#include "SpinLock.h"
 #include <memory>
+#include <mutex>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 class Player;
 class WorldObject;
@@ -30,6 +34,10 @@ typedef std::unordered_map<ObjectGuid, WorldObject*> VisibleWorldObjectsMap;
 typedef std::unordered_map<ObjectGuid, Player*> VisiblePlayersMap;
 
 // Class that manages the visibility containers of a worldobject
+// Thread safety: with intra-map threading the maps are written from several map threads
+// (a link/unlink touches the player's map and the target's map). Every access goes through
+// _lock, and a container never holds its lock while calling into another object, so two
+// container locks are never nested. Callbacks of ForEach* run on a copy, outside the lock.
 class ObjectVisibilityContainer
 {
 public:
@@ -46,33 +54,94 @@ public:
     void LinkWorldObjectVisibility(WorldObject* worldObject);
     void UnlinkWorldObjectVisibility(WorldObject* worldObject);
 
-    // These helpers aren't ideal, but needed in a few spots for cleaning up references
-    VisibleWorldObjectsMap::iterator UnlinkVisibilityFromPlayer(WorldObject* worldObject, VisibleWorldObjectsMap::iterator itr);
-    VisiblePlayersMap::iterator UnlinkVisibilityFromWorldObject(Player* player, VisiblePlayersMap::iterator itr);
+    // Removes player from the players who can see us, and us from the player's visible objects
+    void UnlinkVisiblePlayer(Player* player);
 
-    // Returns a list of all players who can see us
-    VisiblePlayersMap& GetVisiblePlayersMap() { return _visiblePlayersMap; }
-    VisiblePlayersMap const& GetVisiblePlayersMap() const { return _visiblePlayersMap; }
+    // True if at least one player can see us
+    [[nodiscard]] bool HasVisiblePlayers() const;
 
-    // Returns a list of all worldobjects who we can see
-    // Warning: This is for player objects only, all other objects will return a nullptr
-    VisibleWorldObjectsMap* GetVisibleWorldObjectsMap()
+    // True if we (a player) can see at least one worldobject. Always false for non-players.
+    [[nodiscard]] bool HasVisibleWorldObjects() const;
+
+    // True if we (a player) can see the worldobject with this guid. Always false for non-players.
+    [[nodiscard]] bool IsWorldObjectVisible(ObjectGuid guid) const;
+
+    // Calls worker(Player*) for all players who can see us.
+    // Works on a snapshot taken under the lock, the worker runs without the lock held.
+    template<typename Worker>
+    void ForEachVisiblePlayer(Worker&& worker) const
     {
-        if (!_visibleWorldObjectsMap)
-            return nullptr;
+        ScratchBuffer<Player> scratch;
+        std::vector<Player*>& players = scratch.Get();
+        {
+            std::lock_guard<Acore::SpinLock> guard(_lock);
+            players.reserve(_visiblePlayersMap.size());
+            for (auto const& kvPair : _visiblePlayersMap)
+                players.push_back(kvPair.second);
+        }
 
-        return _visibleWorldObjectsMap.get();
+        for (Player* player : players)
+            worker(player);
     }
 
-    VisibleWorldObjectsMap const* GetVisibleWorldObjectsMap() const
+    // Calls worker(WorldObject*) for all worldobjects we (a player) can see. Does nothing for non-players.
+    // Works on a snapshot taken under the lock, the worker runs without the lock held.
+    template<typename Worker>
+    void ForEachVisibleWorldObject(Worker&& worker) const
     {
-        if (!_visibleWorldObjectsMap)
-            return nullptr;
+        ScratchBuffer<WorldObject> scratch;
+        std::vector<WorldObject*>& worldObjects = scratch.Get();
+        {
+            std::lock_guard<Acore::SpinLock> guard(_lock);
+            if (!_visibleWorldObjectsMap)
+                return;
 
-        return _visibleWorldObjectsMap.get();
+            worldObjects.reserve(_visibleWorldObjectsMap->size());
+            for (auto const& kvPair : *_visibleWorldObjectsMap)
+                worldObjects.push_back(kvPair.second);
+        }
+
+        for (WorldObject* worldObject : worldObjects)
+            worker(worldObject);
     }
 
 private:
+    // Per-thread pool of snapshot vectors, so ForEach* does not allocate in steady state
+    // and stays safe when a worker re-enters ForEach* (each nesting level takes its own vector).
+    template<typename T>
+    class ScratchBuffer
+    {
+    public:
+        ScratchBuffer()
+        {
+            std::vector<std::vector<T*>>& pool = Pool();
+            if (!pool.empty())
+            {
+                _buffer = std::move(pool.back());
+                pool.pop_back();
+            }
+        }
+
+        ~ScratchBuffer()
+        {
+            _buffer.clear();
+            Pool().push_back(std::move(_buffer));
+        }
+
+        ScratchBuffer(ScratchBuffer const&) = delete;
+        ScratchBuffer& operator=(ScratchBuffer const&) = delete;
+
+        std::vector<T*>& Get() { return _buffer; }
+
+    private:
+        static std::vector<std::vector<T*>>& Pool()
+        {
+            thread_local std::vector<std::vector<T*>> pool;
+            return pool;
+        }
+
+        std::vector<T*> _buffer;
+    };
 
     // Directly removes visibility reference. This is to be ONLY used as
     // a more efficient method for cleaning up visibility references.
@@ -88,6 +157,9 @@ private:
     void DirectRemoveVisiblePlayerReference(ObjectGuid guid);
 
     WorldObject* _selfObject;
+
+    // Protects _visibleWorldObjectsMap and _visiblePlayersMap
+    mutable Acore::SpinLock _lock;
 
     // List of all worldobjects that are visible to us (including other players)
     // Only players contain this map, thus we will only allocate it as needed.
