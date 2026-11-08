@@ -1017,6 +1017,10 @@ void Map::FinishPhase()
         scratch.heaviestTaskMs = 0.0;
     }
 
+    // Apply the collision tree changes queued during the phase before the deferred ops, which may free models
+    // that a queued change still references (GameObject::UpdateModel)
+    Balance();
+
     _threadingStats.deferredOps += deferred.size();
     for (MapWorkerScratch::DeferredOp& op : deferred)
     {

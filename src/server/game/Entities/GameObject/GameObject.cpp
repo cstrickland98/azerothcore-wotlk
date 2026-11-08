@@ -2716,7 +2716,16 @@ void GameObject::UpdateModel()
     if (m_model)
         if (GetMap()->ContainsGameObjectModel(*m_model))
             GetMap()->RemoveGameObjectModel(*m_model);
-    delete m_model;
+
+    // In a parallel phase the tree removal above is queued until the phase boundary: free the model after it
+    if (m_model && GetMap()->IsParallelPhase())
+    {
+        GameObjectModel* oldModel = m_model;
+        GetMap()->DeferToPhaseEnd([oldModel]() { delete oldModel; });
+    }
+    else
+        delete m_model;
+
     m_model = CreateModel();
     if (m_model)
         GetMap()->InsertGameObjectModel(*m_model);
