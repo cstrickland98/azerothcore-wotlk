@@ -184,8 +184,10 @@ struct MapWorkerScratch
         std::function<void(WorldObject*)> fn;
     };
 
-    std::vector<Object*> updateObjects;
-    std::vector<Object*> updateObjectsRemoved;
+    // AddUpdateObject (true) / RemoveUpdateObject (false) in call order; the pointers are keys only, a removed
+    // object can be freed before the phase ends (Item::SetState(ITEM_REMOVED))
+    std::vector<std::pair<Object*, bool>> updateObjectLog;
+    std::vector<WorldObject*> removeList;                   // AddObjectToRemoveList
     std::vector<Unit*> delayedVisibility;                   // registered this tick, carried to the next one
     std::vector<Unit*> delayedVisibilitySerial;             // bucketed units that left their task's grid
     std::vector<Creature*> creaturesToMove;
@@ -609,7 +611,7 @@ public:
     void AddUpdateObject(Object* obj)
     {
         if (MapWorkerScratch* scratch = GetPhaseScratch())
-            scratch->updateObjects.push_back(obj);
+            scratch->updateObjectLog.emplace_back(obj, true);
         else
             _updateObjects.insert(obj);
     }
@@ -617,7 +619,7 @@ public:
     void RemoveUpdateObject(Object* obj)
     {
         if (MapWorkerScratch* scratch = GetPhaseScratch())
-            scratch->updateObjectsRemoved.push_back(obj);
+            scratch->updateObjectLog.emplace_back(obj, false);
         else
             _updateObjects.erase(obj);
     }

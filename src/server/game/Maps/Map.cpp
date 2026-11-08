@@ -935,11 +935,16 @@ void Map::FinishPhase()
 
     for (MapWorkerScratch& scratch : _scratch)
     {
-        _updateObjects.insert(scratch.updateObjects.begin(), scratch.updateObjects.end());
-        for (Object* obj : scratch.updateObjectsRemoved)
-            if (!obj->IsInWorld())
+        // Replayed in call order without dereferencing: a removed object may be freed already
+        for (auto const& [obj, added] : scratch.updateObjectLog)
+        {
+            if (added)
+                _updateObjects.insert(obj);
+            else
                 _updateObjects.erase(obj);
+        }
 
+        i_objectsToRemove.insert(scratch.removeList.begin(), scratch.removeList.end());
         i_objectsForDelayedVisibility.insert(scratch.delayedVisibility.begin(), scratch.delayedVisibility.end());
         AppendTo(_serialDelayedVisibility, scratch.delayedVisibilitySerial);
         AppendTo(_creaturesToMove, scratch.creaturesToMove);
@@ -957,8 +962,8 @@ void Map::FinishPhase()
             _threadingStats.heaviestTaskPlayers = scratch.heaviestTaskPlayers;
         }
 
-        scratch.updateObjects.clear();
-        scratch.updateObjectsRemoved.clear();
+        scratch.updateObjectLog.clear();
+        scratch.removeList.clear();
         scratch.delayedVisibility.clear();
         scratch.delayedVisibilitySerial.clear();
         scratch.creaturesToMove.clear();
@@ -2492,7 +2497,10 @@ void Map::AddObjectToRemoveList(WorldObject* obj)
 
     obj->CleanupsBeforeDelete(false);                            // remove or simplify at least cross referenced links
 
-    i_objectsToRemove.insert(obj);
+    if (MapWorkerScratch* scratch = GetPhaseScratch())
+        scratch->removeList.push_back(obj);
+    else
+        i_objectsToRemove.insert(obj);
     //LOG_DEBUG("maps", "Object ({}) added to removing list.", obj->GetGUID().ToString());
 }
 
