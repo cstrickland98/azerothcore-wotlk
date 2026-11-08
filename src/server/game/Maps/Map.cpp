@@ -1099,17 +1099,28 @@ void Map::UpdateParallel(uint32 t_diff, uint32 s_diff)
         _mapCollisionData.GetDynamicTree().SetDeferWrites(true);
         _parallelPhase.store(true, std::memory_order_relaxed);
 
-        _workerPool->Run([&](uint32 workerIndex)
+        try
         {
-            for (;;)
+            _workerPool->Run([&](uint32 workerIndex)
             {
-                std::size_t const i = nextTask.fetch_add(1, std::memory_order_relaxed);
-                if (i >= phaseTasks.size())
-                    break;
+                for (;;)
+                {
+                    std::size_t const i = nextTask.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= phaseTasks.size())
+                        break;
 
-                RunGridTask(_gridTasks[phaseTasks[i]], workerIndex, t_diff, s_diff, recheck);
-            }
-        });
+                    RunGridTask(_gridTasks[phaseTasks[i]], workerIndex, t_diff, s_diff, recheck);
+                }
+            });
+        }
+        catch (...)
+        {
+            // Every helper is done here: leave the map in its serial state for whoever handles the exception
+            MapThreading::Current() = MapThreading::Context();
+            _parallelPhase.store(false, std::memory_order_relaxed);
+            _mapCollisionData.GetDynamicTree().SetDeferWrites(false);
+            throw;
+        }
 
         _parallelPhase.store(false, std::memory_order_relaxed);
         _mapCollisionData.GetDynamicTree().SetDeferWrites(false);
