@@ -29,6 +29,7 @@
 // Method that tell amount spawned objects/subpools
 uint32 SpawnedPoolData::GetSpawnedObjects(uint32 pool_id) const
 {
+    std::lock_guard<std::recursive_mutex> guard(mLock);
     SpawnedPoolPools::const_iterator itr = mSpawnedPools.find(pool_id);
     return itr != mSpawnedPools.end() ? itr->second : 0;
 }
@@ -37,6 +38,7 @@ uint32 SpawnedPoolData::GetSpawnedObjects(uint32 pool_id) const
 template<>
 bool SpawnedPoolData::IsSpawnedObject<Creature>(uint32 db_guid) const
 {
+    std::lock_guard<std::recursive_mutex> guard(mLock);
     return mSpawnedCreatures.find(db_guid) != mSpawnedCreatures.end();
 }
 
@@ -44,6 +46,7 @@ bool SpawnedPoolData::IsSpawnedObject<Creature>(uint32 db_guid) const
 template<>
 bool SpawnedPoolData::IsSpawnedObject<GameObject>(uint32 db_guid) const
 {
+    std::lock_guard<std::recursive_mutex> guard(mLock);
     return mSpawnedGameobjects.find(db_guid) != mSpawnedGameobjects.end();
 }
 
@@ -51,6 +54,7 @@ bool SpawnedPoolData::IsSpawnedObject<GameObject>(uint32 db_guid) const
 template<>
 bool SpawnedPoolData::IsSpawnedObject<Pool>(uint32 sub_pool_id) const
 {
+    std::lock_guard<std::recursive_mutex> guard(mLock);
     return mSpawnedPools.find(sub_pool_id) != mSpawnedPools.end();
 }
 
@@ -58,12 +62,14 @@ bool SpawnedPoolData::IsSpawnedObject<Pool>(uint32 sub_pool_id) const
 template<>
 bool SpawnedPoolData::IsSpawnedObject<Quest>(uint32 quest_id) const
 {
+    std::lock_guard<std::recursive_mutex> guard(mLock);
     return mSpawnedQuests.find(quest_id) != mSpawnedQuests.end();
 }
 
 template<>
 void SpawnedPoolData::AddSpawn<Creature>(uint32 db_guid, uint32 pool_id)
 {
+    std::lock_guard<std::recursive_mutex> guard(mLock);
     mSpawnedCreatures.insert(db_guid);
     ++mSpawnedPools[pool_id];
 }
@@ -71,6 +77,7 @@ void SpawnedPoolData::AddSpawn<Creature>(uint32 db_guid, uint32 pool_id)
 template<>
 void SpawnedPoolData::AddSpawn<GameObject>(uint32 db_guid, uint32 pool_id)
 {
+    std::lock_guard<std::recursive_mutex> guard(mLock);
     mSpawnedGameobjects.insert(db_guid);
     ++mSpawnedPools[pool_id];
 }
@@ -78,6 +85,7 @@ void SpawnedPoolData::AddSpawn<GameObject>(uint32 db_guid, uint32 pool_id)
 template<>
 void SpawnedPoolData::AddSpawn<Pool>(uint32 sub_pool_id, uint32 pool_id)
 {
+    std::lock_guard<std::recursive_mutex> guard(mLock);
     mSpawnedPools[sub_pool_id] = 0;
     ++mSpawnedPools[pool_id];
 }
@@ -85,6 +93,7 @@ void SpawnedPoolData::AddSpawn<Pool>(uint32 sub_pool_id, uint32 pool_id)
 template<>
 void SpawnedPoolData::AddSpawn<Quest>(uint32 quest_id, uint32 pool_id)
 {
+    std::lock_guard<std::recursive_mutex> guard(mLock);
     mSpawnedQuests.insert(quest_id);
     ++mSpawnedPools[pool_id];
 }
@@ -92,6 +101,7 @@ void SpawnedPoolData::AddSpawn<Quest>(uint32 quest_id, uint32 pool_id)
 template<>
 void SpawnedPoolData::RemoveSpawn<Creature>(uint32 db_guid, uint32 pool_id)
 {
+    std::lock_guard<std::recursive_mutex> guard(mLock);
     mSpawnedCreatures.erase(db_guid);
     uint32& val = mSpawnedPools[pool_id];
     if (val > 0)
@@ -101,6 +111,7 @@ void SpawnedPoolData::RemoveSpawn<Creature>(uint32 db_guid, uint32 pool_id)
 template<>
 void SpawnedPoolData::RemoveSpawn<GameObject>(uint32 db_guid, uint32 pool_id)
 {
+    std::lock_guard<std::recursive_mutex> guard(mLock);
     mSpawnedGameobjects.erase(db_guid);
     uint32& val = mSpawnedPools[pool_id];
     if (val > 0)
@@ -110,6 +121,7 @@ void SpawnedPoolData::RemoveSpawn<GameObject>(uint32 db_guid, uint32 pool_id)
 template<>
 void SpawnedPoolData::RemoveSpawn<Pool>(uint32 sub_pool_id, uint32 pool_id)
 {
+    std::lock_guard<std::recursive_mutex> guard(mLock);
     mSpawnedPools.erase(sub_pool_id);
     uint32& val = mSpawnedPools[pool_id];
     if (val > 0)
@@ -119,6 +131,7 @@ void SpawnedPoolData::RemoveSpawn<Pool>(uint32 sub_pool_id, uint32 pool_id)
 template<>
 void SpawnedPoolData::RemoveSpawn<Quest>(uint32 quest_id, uint32 pool_id)
 {
+    std::lock_guard<std::recursive_mutex> guard(mLock);
     mSpawnedQuests.erase(quest_id);
     uint32& val = mSpawnedPools[pool_id];
     if (val > 0)
@@ -211,26 +224,32 @@ void PoolGroup<T>::DespawnObject(SpawnedPoolData& spawns, ObjectGuid::LowType gu
 template<>
 void PoolGroup<Creature>::Despawn1Object(SpawnedPoolData& spawns, ObjectGuid::LowType guid)
 {
-    auto creatureBounds = spawns.GetMap()->GetCreatureBySpawnIdStore().equal_range(guid);
-    for (auto itr = creatureBounds.first; itr != creatureBounds.second;)
+    std::vector<Creature*> creatures;
     {
-        Creature* creature = itr->second;
-        ++itr;
-        creature->AddObjectToRemoveList();
+        auto storeGuard = spawns.GetMap()->LockObjectsStoreForRead();
+        auto creatureBounds = spawns.GetMap()->GetCreatureBySpawnIdStore().equal_range(guid);
+        for (auto itr = creatureBounds.first; itr != creatureBounds.second; ++itr)
+            creatures.push_back(itr->second);
     }
+
+    for (Creature* creature : creatures)
+        creature->AddObjectToRemoveList();
 }
 
 // Same on one gameobject
 template<>
 void PoolGroup<GameObject>::Despawn1Object(SpawnedPoolData& spawns, ObjectGuid::LowType guid)
 {
-    auto gameobjectBounds = spawns.GetMap()->GetGameObjectBySpawnIdStore().equal_range(guid);
-    for (auto itr = gameobjectBounds.first; itr != gameobjectBounds.second;)
+    std::vector<GameObject*> gameobjects;
     {
-        GameObject* go = itr->second;
-        ++itr;
-        go->AddObjectToRemoveList();
+        auto storeGuard = spawns.GetMap()->LockObjectsStoreForRead();
+        auto gameobjectBounds = spawns.GetMap()->GetGameObjectBySpawnIdStore().equal_range(guid);
+        for (auto itr = gameobjectBounds.first; itr != gameobjectBounds.second; ++itr)
+            gameobjects.push_back(itr->second);
     }
+
+    for (GameObject* go : gameobjects)
+        go->AddObjectToRemoveList();
 }
 
 // Same on one pool
@@ -1132,7 +1151,7 @@ void PoolMgr::SpawnPool<Creature>(SpawnedPoolData& spawnedPoolData, uint32 pool_
 {
     auto it = mPoolCreatureGroups.find(pool_id);
     if (it != mPoolCreatureGroups.end() && !it->second.IsEmpty())
-        it->second.SpawnObject(spawnedPoolData, mPoolTemplate[pool_id].MaxLimit, db_guid);
+        it->second.SpawnObject(spawnedPoolData, GetPoolMaxLimit(pool_id), db_guid);
 }
 
 // Call to spawn a pool, if cache if true the method will spawn only if cached entry is different
@@ -1142,7 +1161,7 @@ void PoolMgr::SpawnPool<GameObject>(SpawnedPoolData& spawnedPoolData, uint32 poo
 {
     auto it = mPoolGameobjectGroups.find(pool_id);
     if (it != mPoolGameobjectGroups.end() && !it->second.IsEmpty())
-        it->second.SpawnObject(spawnedPoolData, mPoolTemplate[pool_id].MaxLimit, db_guid);
+        it->second.SpawnObject(spawnedPoolData, GetPoolMaxLimit(pool_id), db_guid);
 }
 
 // Call to spawn a pool, if cache if true the method will spawn only if cached entry is different
@@ -1152,7 +1171,7 @@ void PoolMgr::SpawnPool<Pool>(SpawnedPoolData& spawnedPoolData, uint32 pool_id, 
 {
     auto it = mPoolPoolGroups.find(pool_id);
     if (it != mPoolPoolGroups.end() && !it->second.IsEmpty())
-        it->second.SpawnObject(spawnedPoolData, mPoolTemplate[pool_id].MaxLimit, sub_pool_id);
+        it->second.SpawnObject(spawnedPoolData, GetPoolMaxLimit(pool_id), sub_pool_id);
 }
 
 // Call to spawn a pool
@@ -1161,11 +1180,18 @@ void PoolMgr::SpawnPool<Quest>(SpawnedPoolData& spawnedPoolData, uint32 pool_id,
 {
     auto it = mPoolQuestGroups.find(pool_id);
     if (it != mPoolQuestGroups.end() && !it->second.IsEmpty())
-        it->second.SpawnObject(spawnedPoolData, mPoolTemplate[pool_id].MaxLimit, quest_id);
+        it->second.SpawnObject(spawnedPoolData, GetPoolMaxLimit(pool_id), quest_id);
+}
+
+uint32 PoolMgr::GetPoolMaxLimit(uint32 pool_id) const
+{
+    PoolTemplateData const* poolTemplate = GetPoolTemplate(pool_id);
+    return poolTemplate ? poolTemplate->MaxLimit : 0;
 }
 
 void PoolMgr::SpawnPool(SpawnedPoolData& spawnedPoolData, uint32 pool_id)
 {
+    std::lock_guard<std::recursive_mutex> guard(spawnedPoolData.GetLock());
     SpawnPool<Pool>(spawnedPoolData, pool_id, 0);
     SpawnPool<GameObject>(spawnedPoolData, pool_id, 0);
     SpawnPool<Creature>(spawnedPoolData, pool_id, 0);
@@ -1174,6 +1200,7 @@ void PoolMgr::SpawnPool(SpawnedPoolData& spawnedPoolData, uint32 pool_id)
 // Call to despawn a pool, all gameobjects/creatures in this pool are removed
 void PoolMgr::DespawnPool(SpawnedPoolData& spawnedPoolData, uint32 pool_id)
 {
+    std::lock_guard<std::recursive_mutex> guard(spawnedPoolData.GetLock());
     {
         auto it = mPoolCreatureGroups.find(pool_id);
         if (it != mPoolCreatureGroups.end() && !it->second.IsEmpty())
@@ -1248,6 +1275,7 @@ bool PoolMgr::CheckPool(uint32 pool_id) const
 template<typename T>
 void PoolMgr::UpdatePool(SpawnedPoolData& spawnedPoolData, uint32 pool_id, uint32 db_guid_or_pool_id)
 {
+    std::lock_guard<std::recursive_mutex> guard(spawnedPoolData.GetLock());
     if (uint32 motherpoolid = IsPartOfAPool<Pool>(pool_id))
         SpawnPool<Pool>(spawnedPoolData, motherpoolid, pool_id);
     else
