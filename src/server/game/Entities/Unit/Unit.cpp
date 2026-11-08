@@ -13863,6 +13863,84 @@ bool Unit::HandleAuraRaidProcFromCharge(AuraEffect* triggeredByAura)
     return true;
 }
 
+namespace
+{
+    // The killer's side of Unit::Kill, in the order Kill runs it: rewards, credit, AI and hooks of the killer, its
+    // owner and the rewarded player. Each stage is called where Kill reached it, or all of them later on the far
+    // killer's owner (pointers resolved again there, so any of them can be null then).
+    enum class KillerStage : uint8
+    {
+        Reward,
+        PetKillHook,
+        KillingBlow,
+        PetKilledUnit,
+        KillerAI,
+        KillCredit,
+        OutdoorPvP,
+        PvPKillHooks,
+        Max
+    };
+
+    void RunKillerStage(KillerStage stage, Player* player, Unit* killer, Unit* victim)
+    {
+        switch (stage)
+        {
+            case KillerStage::Reward:
+                if (player)
+                    player->RewardPlayerAndGroupAtKill(victim, false);
+                break;
+            case KillerStage::PetKillHook:
+                if (killer)
+                    sScriptMgr->OnPlayerCreatureKilledByPet(killer->GetCharmerOrOwnerPlayerOrPlayerItself(),
+                        victim->ToCreature());
+                break;
+            case KillerStage::KillingBlow:
+                if (killer)
+                    if (Player* killerPlayer = killer->GetCharmerOrOwnerPlayerOrPlayerItself())
+                        killerPlayer->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_GET_KILLING_BLOWS, 1, 0,
+                            victim);
+                break;
+            case KillerStage::PetKilledUnit:
+                if (player)
+                {
+                    Pet* pet = player->GetPet();
+                    if (pet && pet->IsAlive() && pet->isControlled())
+                        pet->AI()->KilledUnit(victim);
+                }
+                break;
+            case KillerStage::KillerAI:
+                if (killer && killer->IsCreature() && killer->IsAIEnabled)
+                    killer->ToCreature()->AI()->KilledUnit(victim);
+                break;
+            case KillerStage::KillCredit:
+                if (player)
+                    sScriptMgr->OnPlayerCreatureKillCredit(player, victim->ToCreature());
+                break;
+            case KillerStage::OutdoorPvP:
+                if (player)
+                {
+                    if (OutdoorPvP* pvp = player->GetOutdoorPvP())
+                        pvp->HandleKill(player, victim);
+
+                    if (Battlefield* bf = sBattlefieldMgr->GetBattlefieldToZoneId(player->GetZoneId()))
+                        bf->HandleKill(player, victim);
+                }
+                break;
+            case KillerStage::PvPKillHooks:
+                if (Player* killerPlr = killer ? killer->ToPlayer() : nullptr)
+                {
+                    if (Player* killedPlr = victim->ToPlayer())
+                        sScriptMgr->OnPlayerPVPKill(killerPlr, killedPlr);
+                    else if (Creature* killedCre = victim->ToCreature())
+                        sScriptMgr->OnPlayerCreatureKill(killerPlr, killedCre);
+                }
+                break;
+            default:
+                break;
+        }
+    }
+}
+
 void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackType attackType, SpellInfo const* /*spellProto*/, Spell const* /*spell*/ /*= nullptr*/)
 {
     // Prevent killing unit twice (and giving reward from kill twice)
@@ -13903,6 +13981,29 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
     // Exploit fix
     if (creature && creature->IsPet() && creature->GetOwnerGUID().IsPlayer())
         isRewardAllowed = false;
+
+    // A killer (the caster of a periodic tick) or rewarded player outside the running task's area: the victim side
+    // runs now, the killer side collects its stages and runs them on that unit's owner after the phase
+    Map* killMap = victim->GetMap();
+    Unit* farKiller = nullptr;
+    if (killMap->IsParallelPhase())
+    {
+        Player* killerPlayer = killer ? killer->GetCharmerOrOwnerPlayerOrPlayerItself() : nullptr;
+        if (killer && !killMap->CanWriteNow(killer))
+            farKiller = killer;
+        else if (killerPlayer && !killMap->CanWriteNow(killerPlayer))
+            farKiller = killerPlayer;
+        else if (player && !killMap->CanWriteNow(player))
+            farKiller = player;
+    }
+    uint32 deferredStages = 0;
+    auto runKillerStage = [&](KillerStage stage)
+    {
+        if (farKiller)
+            deferredStages |= 1u << AsUnderlyingType(stage);
+        else
+            RunKillerStage(stage, player, killer, victim);
+    };
 
     // Reward player, his pets, and group/raid members
     // call kill spell proc event (before real die and combat stop to triggering auras removed at death/combat stop)
@@ -13973,7 +14074,7 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
             }
         }
 
-        player->RewardPlayerAndGroupAtKill(victim, false);
+        runKillerStage(KillerStage::Reward);
     }
 
     // Do KILL and KILLED procs. KILL proc is called only for the unit who landed the killing blow (and its owner - for pets and totems) regardless of who tapped the victim
@@ -13982,7 +14083,7 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
         if (Unit* owner = killer->GetOwner())
         {
             Unit::ProcSkillsAndAuras(owner, victim, PROC_FLAG_KILL, PROC_FLAG_NONE, PROC_EX_NONE, 0, attackType, nullptr, nullptr, -1, nullptr);
-            sScriptMgr->OnPlayerCreatureKilledByPet( killer->GetCharmerOrOwnerPlayerOrPlayerItself(), victim->ToCreature());
+            runKillerStage(KillerStage::PetKillHook);
         }
 
     if (killer != victim)
@@ -13996,8 +14097,7 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
     // update get killing blow achievements, must be done before setDeathState to be able to require auras on target
     // and before Spirit of Redemption as it also removes auras
     if (killer)
-        if (Player* killerPlayer = killer->GetCharmerOrOwnerPlayerOrPlayerItself())
-            killerPlayer->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_GET_KILLING_BLOWS, 1, 0, victim);
+        runKillerStage(KillerStage::KillingBlow);
 
     // Spirit of Redemption
     // if talent known but not triggered (check priest class for speedup check)
@@ -14050,11 +14150,7 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
     // MUST come after victim->setDeathState(DeathState::JustDied); or pet next target
     // selection will get stuck on same target and break pet react state
     if (player)
-    {
-        Pet* pet = player->GetPet();
-        if (pet && pet->IsAlive() && pet->isControlled())
-            pet->AI()->KilledUnit(victim);
-    }
+        runKillerStage(KillerStage::PetKilledUnit);
 
     // 10% durability loss on death
     // clean InHateListOf
@@ -14074,7 +14170,7 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
         }
         // Call KilledUnit for creatures
         if (killer && killer->IsCreature() && killer->IsAIEnabled)
-            killer->ToCreature()->AI()->KilledUnit(victim);
+            runKillerStage(KillerStage::KillerAI);
 
         // last damage from non duel opponent or opponent controlled creature
         if (plrVictim->duel)
@@ -14103,7 +14199,7 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
 
         // Call KilledUnit for creatures, this needs to be called after the lootable flag is set
         if (killer && killer->IsCreature() && killer->IsAIEnabled)
-            killer->ToCreature()->AI()->KilledUnit(victim);
+            runKillerStage(KillerStage::KillerAI);
 
         // Call creature just died function
         if (CreatureAI* ai = creature->AI())
@@ -14127,7 +14223,7 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
         }
 
         if (player)
-            sScriptMgr->OnPlayerCreatureKillCredit(player, creature);
+            runKillerStage(KillerStage::KillCredit);
 
         // Dungeon specific stuff, only applies to players killing creatures
         if (creature->GetInstanceId())
@@ -14146,13 +14242,7 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
     // outdoor pvp things, do these after setting the death state, else the player activity notify won't work... doh...
     // handle player kill only if not suicide (spirit of redemption for example)
     if (player && killer != victim)
-    {
-        if (OutdoorPvP* pvp = player->GetOutdoorPvP())
-            pvp->HandleKill(player, victim);
-
-        if (Battlefield* bf = sBattlefieldMgr->GetBattlefieldToZoneId(player->GetZoneId()))
-            bf->HandleKill(player, victim);
-    }
+        runKillerStage(KillerStage::OutdoorPvP);
 
     //if (victim->IsPlayer())
     //    if (OutdoorPvP* pvp = victim->ToPlayer()->GetOutdoorPvP())
@@ -14180,13 +14270,8 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
     // Hook for OnPVPKill Event
     if (killer)
     {
-        if (Player* killerPlr = killer->ToPlayer())
-        {
-            if (Player* killedPlr = victim->ToPlayer())
-                sScriptMgr->OnPlayerPVPKill(killerPlr, killedPlr);
-            else if (Creature* killedCre = victim->ToCreature())
-                sScriptMgr->OnPlayerCreatureKill(killerPlr, killedCre);
-        }
+        if (killer->ToPlayer())
+            runKillerStage(KillerStage::PvPKillHooks);
         else if (Creature* killerCre = killer->ToCreature())
         {
             if (Player* killed = victim->ToPlayer())
@@ -14195,6 +14280,29 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
     }
 
     sScriptMgr->OnUnitDeath(victim, killer);
+
+    if (!deferredStages)
+        return;
+
+    ObjectGuid const killerGuid = killer ? killer->GetGUID() : ObjectGuid::Empty;
+    ObjectGuid const playerGuid = player ? player->GetGUID() : ObjectGuid::Empty;
+    killMap->RunOnOwner(farKiller->GetGUID(), [deferredStages, killerGuid, playerGuid, victimGuid = victim->GetGUID()](
+        WorldObject* target)
+    {
+        Unit* deferredVictim = ObjectAccessor::GetUnit(*target, victimGuid);
+        if (!deferredVictim)
+        {
+            LOG_DEBUG("maps.threading", "Unit::Kill: victim {} gone before its far killer's side ran",
+                victimGuid.ToString());
+            return;
+        }
+
+        Unit* deferredKiller = killerGuid ? ObjectAccessor::GetUnit(*target, killerGuid) : nullptr;
+        Player* deferredPlayer = playerGuid ? ObjectAccessor::GetPlayer(*target, playerGuid) : nullptr;
+        for (uint8 stage = 0; stage < AsUnderlyingType(KillerStage::Max); ++stage)
+            if (deferredStages & (1u << stage))
+                RunKillerStage(KillerStage(stage), deferredPlayer, deferredKiller, deferredVictim);
+    });
 }
 
 void Unit::SetControlled(bool apply, UnitState state, Unit* source /*= nullptr*/, bool isFear /*= false*/)
