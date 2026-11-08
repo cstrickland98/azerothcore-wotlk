@@ -63,6 +63,17 @@ namespace
 
         return ObjectGuid::Empty;
     }
+
+    // Runs fn on a quest target player now when the running grid task may write it, otherwise in the serial step
+    // after the map phase (the player can be far from the scripted object, in another task's area)
+    void RunOnPlayer(Player* player, std::function<void(Player*)> fn)
+    {
+        player->GetMap()->RunOnOwner(player, [fn = std::move(fn)](WorldObject* target)
+        {
+            if (Player* targetPlayer = target->ToPlayer())
+                fn(targetPlayer);
+        });
+    }
 }
 
 SmartScript::SmartScript()
@@ -533,7 +544,7 @@ void SmartScript::ProcessAction(SmartScriptHolder& e, Unit* unit, uint32 var0, u
             {
                 if (IsPlayer(target))
                 {
-                    target->ToPlayer()->FailQuest(e.action.quest.quest);
+                    RunOnPlayer(target->ToPlayer(), [questId = e.action.quest.quest](Player* player) { player->FailQuest(questId); });
                     LOG_DEBUG("scripts.ai", "SmartScript::ProcessAction:: SMART_ACTION_FAIL_QUEST: Player guidLow {} fails quest {}",
                               target->GetGUID().ToString(), e.action.quest.quest);
                 }
@@ -563,7 +574,7 @@ void SmartScript::ProcessAction(SmartScriptHolder& e, Unit* unit, uint32 var0, u
                         }
                         else
                         {
-                            player->AddQuestAndCheckCompletion(q, nullptr);
+                            RunOnPlayer(player, [q](Player* questPlayer) { questPlayer->AddQuestAndCheckCompletion(q, nullptr); });
                             LOG_DEBUG("scripts.ai", "SmartScript::ProcessAction:: SMART_ACTION_OFFER_QUEST: Player guidLow {} - quest {} added",
                                       player->GetGUID().ToString(), e.action.questOffer.questID);
                         }
@@ -639,11 +650,11 @@ void SmartScript::ProcessAction(SmartScriptHolder& e, Unit* unit, uint32 var0, u
                     if (Vehicle* vehicle = target->ToUnit()->GetVehicleKit())
                         for (auto & Seat : vehicle->Seats)
                             if (Player* player = ObjectAccessor::GetPlayer(*target, Seat.second.Passenger.Guid))
-                                player->AreaExploredOrEventHappens(e.action.quest.quest);
+                                RunOnPlayer(player, [questId = e.action.quest.quest](Player* questPlayer) { questPlayer->AreaExploredOrEventHappens(questId); });
 
                 if (IsPlayer(target))
                 {
-                    target->ToPlayer()->AreaExploredOrEventHappens(e.action.quest.quest);
+                    RunOnPlayer(target->ToPlayer(), [questId = e.action.quest.quest](Player* player) { player->AreaExploredOrEventHappens(questId); });
 
                     LOG_DEBUG("scripts.ai", "SmartScript::ProcessAction:: SMART_ACTION_CALL_AREAEXPLOREDOREVENTHAPPENS: Player guidLow {} credited quest {}",
                               target->GetGUID().ToString(), e.action.quest.quest);
@@ -1091,6 +1102,25 @@ void SmartScript::ProcessAction(SmartScriptHolder& e, Unit* unit, uint32 var0, u
         }
         case SMART_ACTION_CALL_GROUPEVENTHAPPENS:
         {
+            // The player can be far, in another grid task's area: credit it in the map phase's serial step then,
+            // with the event object resolved again (still found there when it left the world during the phase)
+            WorldObject* baseObject = GetBaseObject();
+            auto runGroupEventHappens = [baseObject](Player* player, uint32 questId)
+            {
+                Map* map = player->GetMap();
+                if (map->CanWriteNow(player))
+                {
+                    player->GroupEventHappens(questId, baseObject);
+                    return;
+                }
+
+                map->RunOnOwner(player, [questId, baseGuid = baseObject ? baseObject->GetGUID() : ObjectGuid::Empty](WorldObject* target)
+                {
+                    if (Player* questPlayer = target->ToPlayer())
+                        questPlayer->GroupEventHappens(questId, baseGuid ? questPlayer->GetMap()->FindObjectForDeferredOp(baseGuid) : nullptr);
+                });
+            };
+
             for (WorldObject* target : targets)
             {
                 if (!IsUnit(target))
@@ -1101,7 +1131,7 @@ void SmartScript::ProcessAction(SmartScriptHolder& e, Unit* unit, uint32 var0, u
                 Player* player = unitTarget->GetCharmerOrOwnerPlayerOrPlayerItself();
                 if (player && GetBaseObject())
                 {
-                    player->GroupEventHappens(e.action.quest.quest, GetBaseObject());
+                    runGroupEventHappens(player, e.action.quest.quest);
                     LOG_DEBUG("scripts.ai", "SmartScript::ProcessAction: SMART_ACTION_CALL_GROUPEVENTHAPPENS: Player {}, group credit for quest {}",
                         player->GetGUID().ToString(), e.action.quest.quest);
                 }
@@ -1113,7 +1143,7 @@ void SmartScript::ProcessAction(SmartScriptHolder& e, Unit* unit, uint32 var0, u
                     {
                         if (Player* player = ObjectAccessor::GetPlayer(*unitTarget, Seat.second.Passenger.Guid))
                         {
-                            player->GroupEventHappens(e.action.quest.quest, GetBaseObject());
+                            runGroupEventHappens(player, e.action.quest.quest);
                         }
                     }
                 }
@@ -1199,7 +1229,7 @@ void SmartScript::ProcessAction(SmartScriptHolder& e, Unit* unit, uint32 var0, u
         {
             if (trigger && IsPlayer(unit))
             {
-                unit->ToPlayer()->RewardPlayerAndGroupAtEvent(e.action.killedMonster.creature, unit);
+                RunOnPlayer(unit->ToPlayer(), [creatureId = e.action.killedMonster.creature](Player* player) { player->RewardPlayerAndGroupAtEvent(creatureId, player); });
                 LOG_DEBUG("sql.sql", "SmartScript::ProcessAction: SMART_ACTION_CALL_KILLEDMONSTER: (trigger == true) Player {}, Killcredit: {}",
                           unit->GetGUID().ToString(), e.action.killedMonster.creature);
             }
@@ -1210,7 +1240,7 @@ void SmartScript::ProcessAction(SmartScriptHolder& e, Unit* unit, uint32 var0, u
 
                 if (Player* player = me->GetLootRecipient())
                 {
-                    player->RewardPlayerAndGroupAtEvent(e.action.killedMonster.creature, player);
+                    RunOnPlayer(player, [creatureId = e.action.killedMonster.creature](Player* creditPlayer) { creditPlayer->RewardPlayerAndGroupAtEvent(creatureId, creditPlayer); });
                     LOG_DEBUG("sql.sql", "SmartScript::ProcessAction: SMART_ACTION_CALL_KILLEDMONSTER: Player {}, Killcredit: {}",
                               player->GetGUID().ToString(), e.action.killedMonster.creature);
                 }
@@ -1226,7 +1256,7 @@ void SmartScript::ProcessAction(SmartScriptHolder& e, Unit* unit, uint32 var0, u
                     if (!player)
                         continue;
 
-                    player->RewardPlayerAndGroupAtEvent(e.action.killedMonster.creature, player);
+                    RunOnPlayer(player, [creatureId = e.action.killedMonster.creature](Player* creditPlayer) { creditPlayer->RewardPlayerAndGroupAtEvent(creatureId, creditPlayer); });
                     LOG_DEBUG("sql.sql", "SmartScript::ProcessAction: SMART_ACTION_CALL_KILLEDMONSTER: Player {}, Killcredit: {}",
                               target->GetGUID().ToString(), e.action.killedMonster.creature);
                 }
