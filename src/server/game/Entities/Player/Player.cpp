@@ -103,6 +103,19 @@
 //  see: https://github.com/azerothcore/azerothcore-wotlk/issues/9766
 #include "GridNotifiersImpl.h"
 
+namespace
+{
+    // the group's member list is shared by members on several map threads; change it under the group's lock
+    void UnlinkGroupReference(GroupReference& reference)
+    {
+        if (Group* group = reference.getTarget())
+        {
+            std::lock_guard<std::recursive_mutex> guard(group->GetLock());
+            reference.unlink();
+        }
+    }
+}
+
 enum CharacterFlags
 {
     CHARACTER_FLAG_NONE                 = 0x00000000,
@@ -11756,9 +11769,8 @@ void Player::SetSelection(ObjectGuid guid)
 
 void Player::SetGroup(Group* group, int8 subgroup)
 {
-    if (!group)
-        m_group.unlink();
-    else
+    UnlinkGroupReference(m_group);
+    if (group)
     {
         // never use SetGroup without a subgroup unless you specify nullptr for group
         ASSERT(subgroup >= 0);
@@ -13430,7 +13442,7 @@ void Player::SetBattlegroundOrBattlefieldRaid(Group* group, int8 subgroup)
 
     SetOriginalGroup(GetGroup(), GetSubGroup());
 
-    m_group.unlink();
+    UnlinkGroupReference(m_group);
     m_group.link(group, this);
     m_group.setSubGroup((uint8)subgroup);
 }
@@ -13438,7 +13450,7 @@ void Player::SetBattlegroundOrBattlefieldRaid(Group* group, int8 subgroup)
 void Player::RemoveFromBattlegroundOrBattlefieldRaid()
 {
     //remove existing reference
-    m_group.unlink();
+    UnlinkGroupReference(m_group);
     if (Group* group = GetOriginalGroup())
     {
         m_group.link(group, this);
@@ -13449,9 +13461,8 @@ void Player::RemoveFromBattlegroundOrBattlefieldRaid()
 
 void Player::SetOriginalGroup(Group* group, int8 subgroup)
 {
-    if (!group)
-        m_originalGroup.unlink();
-    else
+    UnlinkGroupReference(m_originalGroup);
+    if (group)
     {
         // never use SetOriginalGroup without a subgroup unless you specify nullptr for group
         ASSERT(subgroup >= 0);
