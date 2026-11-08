@@ -955,7 +955,15 @@ HappinessState Pet::GetHappinessState()
 
 void Pet::Remove(PetSaveMode mode, bool returnreagent)
 {
-    GetOwner()->RemovePet(this, mode, returnreagent);
+    if (Player* owner = GetOwner())
+    {
+        owner->RemovePet(this, mode, returnreagent);
+        return;
+    }
+
+    // the owner left the map before this deferred unsummon ran (far teleport): nothing to save or detach, just leave
+    AddObjectToRemoveList();
+    m_removed = true;
 }
 
 void Pet::GivePetXP(uint32 xp)
