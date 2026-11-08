@@ -3837,6 +3837,38 @@ void Unit::_DeleteRemovedAuras()
     }
 }
 
+// Clears the owner of a gameobject in owner's list and deletes it when del. The gameobject can be far from its
+// owner, in another grid task's area (a spell object the owner walked away from): it is then written in the
+// serial step after the running map phase, if it is still in the world and still owned by owner.
+static void ReleaseOwnedGameObject(Unit* owner, GameObject* go, bool del)
+{
+    Map* map = owner->FindMap();
+    if (!map || map->CanWriteNow(go))
+    {
+        go->SetOwnerGUID(ObjectGuid::Empty);
+        if (del)
+        {
+            go->SetRespawnTime(0);
+            go->Delete();
+        }
+        return;
+    }
+
+    map->RunOnOwner(go, [ownerGuid = owner->GetGUID(), del](WorldObject* target)
+    {
+        GameObject* gameObj = target->ToGameObject();
+        if (!gameObj || !gameObj->IsInWorld() || gameObj->GetOwnerGUID() != ownerGuid)
+            return;
+
+        gameObj->SetOwnerGUID(ObjectGuid::Empty);
+        if (del)
+        {
+            gameObj->SetRespawnTime(0);
+            gameObj->Delete();
+        }
+    });
+}
+
 void Unit::_UpdateSpells(uint32 time)
 {
     if (m_currentSpells[CURRENT_AUTOREPEAT_SPELL])
@@ -3906,10 +3938,8 @@ void Unit::_UpdateSpells(uint32 time)
             if (GameObject* go = ObjectAccessor::GetGameObject(*this, *itr))
                 if (!go->isSpawned())
                 {
-                    go->SetOwnerGUID(ObjectGuid::Empty);
-                    go->SetRespawnTime(0);
-                    go->Delete();
                     m_gameObj.erase(itr++);
+                    ReleaseOwnedGameObject(this, go, true);
                     continue;
                 }
             ++itr;
@@ -6499,7 +6529,14 @@ void Unit::RemoveGameObject(GameObject* gameObj, bool del)
     if (!gameObj || gameObj->GetOwnerGUID() != GetGUID())
         return;
 
-    gameObj->SetOwnerGUID(ObjectGuid::Empty);
+    // A far gameobject keeps its owner until the phase's serial step: it was already released if no longer listed
+    Map* map = FindMap();
+    bool const writable = !map || map->CanWriteNow(gameObj);
+    if (!writable && std::find(m_gameObj.begin(), m_gameObj.end(), gameObj->GetGUID()) == m_gameObj.end())
+        return;
+
+    if (writable)
+        gameObj->SetOwnerGUID(ObjectGuid::Empty);
 
     for (uint8 i = 0; i < MAX_GAMEOBJECT_SLOT; ++i)
     {
@@ -6527,11 +6564,16 @@ void Unit::RemoveGameObject(GameObject* gameObj, bool del)
 
     m_gameObj.remove(gameObj->GetGUID());
 
-    if (del)
+    if (writable)
     {
-        gameObj->SetRespawnTime(0);
-        gameObj->Delete();
+        if (del)
+        {
+            gameObj->SetRespawnTime(0);
+            gameObj->Delete();
+        }
     }
+    else
+        ReleaseOwnedGameObject(this, gameObj, del);
 }
 
 void Unit::RemoveGameObject(uint32 spellid, bool del)
@@ -6549,12 +6591,7 @@ void Unit::RemoveGameObject(uint32 spellid, bool del)
                 continue;
             }
 
-            go->SetOwnerGUID(ObjectGuid::Empty);
-            if (del)
-            {
-                go->SetRespawnTime(0);
-                go->Delete();
-            }
+            ReleaseOwnedGameObject(this, go, del);
         }
         m_gameObj.erase(itr++);
     }
@@ -6575,12 +6612,7 @@ void Unit::RemoveGameObjectsByType(GameobjectTypes type, bool del)
                 continue;
             }
 
-            go->SetOwnerGUID(ObjectGuid::Empty);
-            if (del)
-            {
-                go->SetRespawnTime(0);
-                go->Delete();
-            }
+            ReleaseOwnedGameObject(this, go, del);
         }
         m_gameObj.erase(itr++);
     }
@@ -6591,13 +6623,9 @@ void Unit::RemoveAllGameObjects()
     while(!m_gameObj.empty())
     {
         GameObject* go = ObjectAccessor::GetGameObject(*this, *m_gameObj.begin());
-        if (go)
-        {
-            go->SetOwnerGUID(ObjectGuid::Empty);
-            go->SetRespawnTime(0);
-            go->Delete();
-        }
         m_gameObj.erase(m_gameObj.begin());
+        if (go)
+            ReleaseOwnedGameObject(this, go, true);
     }
 }
 
