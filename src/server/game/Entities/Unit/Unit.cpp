@@ -12488,7 +12488,9 @@ void Unit::RemoveFromWorld()
             ABORT();
         }
 
-        if (Unit* owner = GetOwner())
+        // A far owner is not ours to write: Minion::RemoveFromWorld queued its SetMinion(false) to the owner
+        // already (RunOnOwner), so neither check nor repeat it here
+        if (Unit* owner = GetOwner(); owner && GetMap()->CanWriteNow(owner))
         {
             if (owner->m_Controlled.find(this) != owner->m_Controlled.end())
             {
