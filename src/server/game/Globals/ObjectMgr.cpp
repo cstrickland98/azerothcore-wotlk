@@ -2788,6 +2788,7 @@ void ObjectMgr::AddCreatureToGrid(ObjectGuid::LowType guid, CreatureData const* 
         if (mask & 1)
         {
             GridCoord gridCoord = Acore::ComputeGridCoord(data->posX, data->posY);
+            std::unique_lock<std::shared_mutex> lock(_mapObjectGuidsLock);
             CellObjectGuids& cell_guids = _mapObjectGuidsStore[MAKE_PAIR32(data->mapid, i)][gridCoord.GetId()];
             cell_guids.creatures.insert(guid);
         }
@@ -2802,6 +2803,7 @@ void ObjectMgr::RemoveCreatureFromGrid(ObjectGuid::LowType guid, CreatureData co
         if (mask & 1)
         {
             GridCoord gridCoord = Acore::ComputeGridCoord(data->posX, data->posY);
+            std::unique_lock<std::shared_mutex> lock(_mapObjectGuidsLock);
             CellObjectGuids& cell_guids = _mapObjectGuidsStore[MAKE_PAIR32(data->mapid, i)][gridCoord.GetId()];
             cell_guids.creatures.erase(guid);
         }
@@ -3240,6 +3242,7 @@ void ObjectMgr::AddGameobjectToGrid(ObjectGuid::LowType guid, GameObjectData con
         if (mask & 1)
         {
             GridCoord gridCoord = Acore::ComputeGridCoord(data->posX, data->posY);
+            std::unique_lock<std::shared_mutex> lock(_mapObjectGuidsLock);
             CellObjectGuids& cell_guids = _mapObjectGuidsStore[MAKE_PAIR32(data->mapid, i)][gridCoord.GetId()];
             cell_guids.gameobjects.insert(guid);
         }
@@ -3254,6 +3257,7 @@ void ObjectMgr::RemoveGameobjectFromGrid(ObjectGuid::LowType guid, GameObjectDat
         if (mask & 1)
         {
             GridCoord gridCoord = Acore::ComputeGridCoord(data->posX, data->posY);
+            std::unique_lock<std::shared_mutex> lock(_mapObjectGuidsLock);
             CellObjectGuids& cell_guids = _mapObjectGuidsStore[MAKE_PAIR32(data->mapid, i)][gridCoord.GetId()];
             cell_guids.gameobjects.erase(guid);
         }
@@ -7682,22 +7686,24 @@ uint32 ObjectMgr::GenerateMailID()
 
 uint32 ObjectMgr::GenerateCreatureSpawnId()
 {
-    if (_creatureSpawnId >= uint32(0xFFFFFF))
+    ObjectGuid::LowType const spawnId = _creatureSpawnId.fetch_add(1);
+    if (spawnId >= uint32(0xFFFFFF))
     {
         LOG_ERROR("server.worldserver", "Creature spawn id overflow!! Can't continue, shutting down server. Search on forum for TCE00007 for more info.");
         World::StopNow(ERROR_EXIT_CODE);
     }
-    return _creatureSpawnId++;
+    return spawnId;
 }
 
 uint32 ObjectMgr::GenerateGameObjectSpawnId()
 {
-    if (_gameObjectSpawnId >= uint32(0xFFFFFF))
+    ObjectGuid::LowType const spawnId = _gameObjectSpawnId.fetch_add(1);
+    if (spawnId >= uint32(0xFFFFFF))
     {
         LOG_ERROR("server.worldserver", "GameObject spawn id overflow!! Can't continue, shutting down server. Search on forum for TCE00007 for more info. ");
         World::StopNow(ERROR_EXIT_CODE);
     }
-    return _gameObjectSpawnId++;
+    return spawnId;
 }
 
 void ObjectMgr::LoadGameObjectLocales()

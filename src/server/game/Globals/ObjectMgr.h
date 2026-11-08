@@ -36,10 +36,12 @@
 #include "TemporarySummon.h"
 #include "Trainer.h"
 #include "VehicleDefines.h"
+#include <atomic>
 #include <functional>
 #include <limits>
 #include <map>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 
 class Item;
@@ -1178,8 +1180,10 @@ public:
         return nullptr;
     }
 
+    // The returned sets change only on spawn edits (commands, game events, outdoor PvP); the lock covers the lookup.
     CellObjectGuids const& GetGridObjectGuids(uint16 mapid, uint8 spawnMode, uint32 gridId)
     {
+        std::shared_lock<std::shared_mutex> lock(_mapObjectGuidsLock);
         MapObjectGuids::const_iterator itr1 = _mapObjectGuidsStore.find(MAKE_PAIR32(mapid, spawnMode));
         if (itr1 != _mapObjectGuidsStore.end())
         {
@@ -1192,6 +1196,7 @@ public:
 
     CellObjectGuidsMap const& GetMapObjectGuids(uint16 mapid, uint8 spawnMode)
     {
+        std::shared_lock<std::shared_mutex> lock(_mapObjectGuidsLock);
         MapObjectGuids::const_iterator itr1 = _mapObjectGuidsStore.find(MAKE_PAIR32(mapid, spawnMode));
         if (itr1 != _mapObjectGuidsStore.end())
             return itr1->second;
@@ -1536,8 +1541,9 @@ private:
     uint32 _hiPetNumber;
     std::mutex _hiPetNumberMutex;
 
-    ObjectGuid::LowType _creatureSpawnId;
-    ObjectGuid::LowType _gameObjectSpawnId;
+    // generated from map threads (Creature::SaveToDB, GameObject::SaveToDB, commands)
+    std::atomic<ObjectGuid::LowType> _creatureSpawnId;
+    std::atomic<ObjectGuid::LowType> _gameObjectSpawnId;
 
     // first free low guid for selected guid type
     template<HighGuid high>
@@ -1653,6 +1659,7 @@ private:
     ItemSetNameContainer _itemSetNameStore;
 
     MapObjectGuids _mapObjectGuidsStore;
+    std::shared_mutex _mapObjectGuidsLock;
     CellObjectGuidsMap _emptyCellObjectGuidsMap;
     CellObjectGuids _emptyCellObjectGuids;
     CreatureDataContainer _creatureDataStore;
