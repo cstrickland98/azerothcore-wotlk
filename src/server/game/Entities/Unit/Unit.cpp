@@ -3821,10 +3821,19 @@ void Unit::_RemoveAuraFromUpdateList(Aura* aura)
 
 void Unit::_DeleteRemovedAuras()
 {
-    while (!m_removedAuras.empty())
+    // An aura whose removal had to queue the unapply of a far target's application to the map
+    // phase's serial step (Aura::QueueRemoteUnapply) is still referenced by that op: keep it
+    // until the next update. Never the case outside a parallel phase.
+    for (AuraList::iterator itr = m_removedAuras.begin(); itr != m_removedAuras.end();)
     {
-        delete m_removedAuras.front();
-        m_removedAuras.pop_front();
+        if ((*itr)->HasPendingRemoteUnapply())
+        {
+            ++itr;
+            continue;
+        }
+
+        delete *itr;
+        itr = m_removedAuras.erase(itr);
     }
 }
 
@@ -5453,13 +5462,22 @@ void Unit::RemoveAreaAurasDueToLeaveWorld()
     {
         Aura* aura = iter->second;
         ++iter;
-        Aura::ApplicationMap const& appMap = aura->GetApplicationMap();
+        // a copy (taken under the aura's lock): far targets may unapply concurrently
+        Aura::ApplicationMap const appMap = aura->GetApplicationMap();
         for (Aura::ApplicationMap::const_iterator itr = appMap.begin(); itr != appMap.end();)
         {
             AuraApplication* aurApp = itr->second;
+            ObjectGuid targetGuid = itr->first;
             ++itr;
+            // already removed by an earlier cascade (the live map iteration would not visit it either)
+            if (aura->GetApplicationOfTarget(targetGuid) != aurApp)
+                continue;
             Unit* target = aurApp->GetTarget();
             if (target == this)
+                continue;
+            // a target the running map task may not write: the aura's removal in
+            // CleanupBeforeRemoveFromMap (RemoveAllAuras -> Aura::_Remove) unapplies it in the serial step
+            if (!GetMap()->CanWriteNow(target))
                 continue;
             target->RemoveAura(aurApp);
             // things linked on aura remove may apply new area aura - so start from the beginning
