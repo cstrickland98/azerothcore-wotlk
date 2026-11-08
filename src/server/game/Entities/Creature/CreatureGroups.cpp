@@ -21,6 +21,7 @@
 #include "GameTime.h"
 #include "Log.h"
 #include "Map.h"
+#include "ObjectAccessor.h"
 #include "MoveSplineInit.h"
 #include "ObjectMgr.h"
 #include "QueryResult.h"
@@ -46,6 +47,7 @@ void FormationMgr::AddCreatureToGroup(uint32 groupId, Creature* member)
         return;
     }
 
+    std::lock_guard<Acore::SpinLock> guard(_holderLock);
     CreatureGroupHolderType::iterator itr = map->CreatureGroupHolder.find(groupId);
 
     //Add member to an existing group
@@ -67,20 +69,24 @@ void FormationMgr::AddCreatureToGroup(uint32 groupId, Creature* member)
 void FormationMgr::RemoveCreatureFromGroup(CreatureGroup* group, Creature* member)
 {
     LOG_DEBUG("entities.unit", "Deleting member pointer to spawnId: {} from group {}", member->GetSpawnId(), group->GetId());
-    group->RemoveMember(member);
 
-    if (group->IsEmpty())
+    uint32 const groupId = group->GetId();
+    Map* map = member->FindMap();
+    CreatureGroup::MemberList followers;
     {
-        Map* map = member->FindMap();
-        if (!map)
+        // Removal, emptiness check and deletion are one step: another member's task may remove the last member
+        std::lock_guard<Acore::SpinLock> guard(_holderLock);
+        if (group->RemoveMember(member, followers) && map)
         {
-            return;
+            LOG_DEBUG("entities.unit", "Deleting group with InstanceID {}", member->GetInstanceId());
+            map->CreatureGroupHolder.erase(groupId);
+            delete group;
         }
-
-        LOG_DEBUG("entities.unit", "Deleting group with InstanceID {}", member->GetInstanceId());
-        map->CreatureGroupHolder.erase(group->GetId());
-        delete group;
     }
+
+    // A leader left: end its followers' formation movement. The group may be gone by now, this only uses values.
+    if (!followers.empty() && map)
+        CreatureGroup::ReleaseFollowers(map, groupId, member, followers);
 }
 
 void FormationMgr::LoadCreatureFormations()
@@ -172,94 +178,194 @@ void FormationMgr::LoadCreatureFormations()
     LOG_INFO("server.loading", " ");
 }
 
+namespace
+{
+    constexpr uint16 GroupFlag(GroupAIFlags flag)
+    {
+        return std::underlying_type_t<GroupAIFlags>(flag);
+    }
+
+    uint16 GetGroupAI(Creature const* member)
+    {
+        auto const itr = sFormationMgr->CreatureGroupMap.find(member->GetSpawnId());
+        return itr != sFormationMgr->CreatureGroupMap.end() ? itr->second.groupAI : 0;
+    }
+
+    // Still a member of group groupId: a deferred write can find it out of the group, or the group deleted
+    bool IsInGroup(Creature const* creature, uint32 groupId)
+    {
+        CreatureGroup const* group = creature->GetFormation();
+        return group && group->GetId() == groupId;
+    }
+
+    // Runs write(member, other) for a formation member written from the task of another member (the leader
+    // moving or resetting, a member engaging or evading). other is a second unit the write touches (the leader
+    // whose follower list a formation movement change edits, an engaged target), or nullptr. In a parallel map
+    // phase, when member or other lies in another grid task's area, the write runs in the serial step at the
+    // phase end instead, with member and other resolved again by GUID; it is skipped when member left the world
+    // or the group, and other is passed as nullptr when gone. write re-checks the member's state since that is a
+    // read of the member. Outside a parallel phase this always runs inline: single-thread behaviour is unchanged.
+    template <class Write>
+    void WriteMember(Map* map, Creature* member, Unit* other, uint32 groupId, Write write)
+    {
+        if (map->CanWriteNow(member) && (!other || map->CanWriteNow(other)))
+        {
+            if (IsInGroup(member, groupId))
+                write(member, other);
+
+            return;
+        }
+
+        ObjectGuid const memberGuid = member->GetGUID();
+        ObjectGuid const otherGuid = other ? other->GetGUID() : ObjectGuid::Empty;
+        map->DeferToPhaseEnd([map, memberGuid, otherGuid, groupId, write]()
+        {
+            Creature* creature = map->GetCreature(memberGuid);
+            if (!creature || !creature->IsInWorld() || !IsInGroup(creature, groupId))
+                return;
+
+            Unit* otherUnit = otherGuid ? ObjectAccessor::GetUnit(*creature, otherGuid) : nullptr;
+            if (otherUnit && !otherUnit->IsInWorld())
+                otherUnit = nullptr;
+
+            write(creature, otherUnit);
+        });
+    }
+}
+
+bool CreatureGroup::IsEmpty() const
+{
+    std::lock_guard<Acore::SpinLock> guard(m_lock);
+    return m_members.empty();
+}
+
+CreatureGroup::MemberList CreatureGroup::CopyMembers(Creature** leader /*= nullptr*/) const
+{
+    std::lock_guard<Acore::SpinLock> guard(m_lock);
+    if (leader)
+        *leader = m_leader;
+
+    return MemberList(m_members.begin(), m_members.end());
+}
+
 void CreatureGroup::AddMember(Creature* member)
 {
     LOG_DEBUG("entities.unit", "CreatureGroup::AddMember: Adding unit {}.", member->GetGUID().ToString());
 
-    //Check if it is a leader
-    if (member->GetSpawnId() == m_groupID)
     {
-        LOG_DEBUG("entities.unit", "Unit {} is formation leader. Adding group.", member->GetGUID().ToString());
-        m_leader = member;
+        std::lock_guard<Acore::SpinLock> guard(m_lock);
+
+        //Check if it is a leader
+        if (member->GetSpawnId() == m_groupID)
+        {
+            LOG_DEBUG("entities.unit", "Unit {} is formation leader. Adding group.", member->GetGUID().ToString());
+            m_leader = member;
+        }
+
+        m_members[member] = sFormationMgr->CreatureGroupMap.find(member->GetSpawnId())->second;
     }
 
-    m_members[member] = sFormationMgr->CreatureGroupMap.find(member->GetSpawnId())->second;
     member->SetFormation(this);
+}
+
+bool CreatureGroup::RemoveMember(Creature* member, MemberList& followers)
+{
+    bool empty;
+    {
+        std::lock_guard<Acore::SpinLock> guard(m_lock);
+        if (m_leader == member)
+        {
+            m_leader = nullptr;
+            for (auto const& itr : m_members)
+                if (itr.first != member)
+                    followers.emplace_back(itr.first, itr.second);
+        }
+
+        m_members.erase(member);
+        empty = m_members.empty();
+    }
+
+    member->SetFormation(nullptr);
+    return empty;
 }
 
 void CreatureGroup::RemoveMember(Creature* member)
 {
-    if (m_leader == member)
-    {
-        RemoveFormationMovement();
-        m_leader = nullptr;
-    }
-
-    m_members.erase(member);
-    member->SetFormation(nullptr);
+    // Read before: once member is out, another member's task may remove the last member and delete this group
+    uint32 const groupId = m_groupID;
+    MemberList followers;
+    RemoveMember(member, followers);
+    if (!followers.empty())
+        ReleaseFollowers(member->GetMap(), groupId, member, followers);
 }
 
 void CreatureGroup::MemberEngagingTarget(Creature* member, Unit* target)
 {
-    uint8 const groupAI = sFormationMgr->CreatureGroupMap[member->GetSpawnId()].groupAI;
-    if (member == m_leader)
+    uint16 const groupAI = GetGroupAI(member);
+    Creature* leader = nullptr;
+    MemberList const members = CopyMembers(&leader);
+    if (member == leader)
     {
-        if (!(groupAI & std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_MEMBER_ASSIST_LEADER)))
+        if (!(groupAI & GroupFlag(GroupAIFlags::GROUP_AI_FLAG_MEMBER_ASSIST_LEADER)))
         {
             return;
         }
     }
-    else if (!(groupAI & std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_LEADER_ASSIST_MEMBER)))
+    else if (!(groupAI & GroupFlag(GroupAIFlags::GROUP_AI_FLAG_LEADER_ASSIST_MEMBER)))
     {
         return;
     }
 
-    for (auto const& itr : m_members)
+    Map* map = member->GetMap();
+    for (auto const& itr : members)
     {
         Creature* pMember = itr.first;
-        if (!pMember)
+        if (!pMember || pMember == member)
         {
             continue;
         }
 
-        if (pMember == member || !pMember->IsAlive() || pMember->GetVictim())
+        if (pMember == leader && !(groupAI & GroupFlag(GroupAIFlags::GROUP_AI_FLAG_LEADER_ASSIST_MEMBER)))
         {
             continue;
         }
 
-        if (pMember == m_leader && !(groupAI & std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_LEADER_ASSIST_MEMBER)))
+        // Engaging also writes the target's threat and combat lists
+        WriteMember(map, pMember, target, m_groupID, [](Creature* creature, Unit* victim)
         {
-            continue;
-        }
+            if (!victim || !creature->IsAlive() || creature->GetVictim())
+                return;
 
-        if (pMember->IsValidAttackTarget(target))
-        {
-            pMember->EngageWithTarget(target);
-        }
+            if (creature->IsValidAttackTarget(victim))
+                creature->EngageWithTarget(victim);
+        });
     }
 }
 
 Unit* CreatureGroup::GetNewTargetForMember(Creature* member)
 {
-    uint8 const groupAI = sFormationMgr->CreatureGroupMap[member->GetSpawnId()].groupAI;
-    if (!(groupAI & std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_ACQUIRE_NEW_TARGET_ON_EVADE)))
+    uint16 const groupAI = GetGroupAI(member);
+    if (!(groupAI & GroupFlag(GroupAIFlags::GROUP_AI_FLAG_ACQUIRE_NEW_TARGET_ON_EVADE)))
     {
         return nullptr;
     }
 
-    if (member == m_leader)
+    Creature* leader = nullptr;
+    MemberList const members = CopyMembers(&leader);
+    if (member == leader)
     {
-        if (!(groupAI & std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_MEMBER_ASSIST_LEADER)))
+        if (!(groupAI & GroupFlag(GroupAIFlags::GROUP_AI_FLAG_MEMBER_ASSIST_LEADER)))
         {
             return nullptr;
         }
     }
-    else if (!(groupAI & std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_LEADER_ASSIST_MEMBER)))
+    else if (!(groupAI & GroupFlag(GroupAIFlags::GROUP_AI_FLAG_LEADER_ASSIST_MEMBER)))
     {
         return nullptr;
     }
 
-    for (auto const& itr : m_members)
+    Map* map = member->GetMap();
+    for (auto const& itr : members)
     {
         Creature* pMember = itr.first;
         if (!pMember)
@@ -267,12 +373,13 @@ Unit* CreatureGroup::GetNewTargetForMember(Creature* member)
             continue;
         }
 
-        if (pMember == member || !pMember->IsAlive() || !pMember->GetVictim())
+        // A member in another grid task's area is not read: its victim is out of this task's reach as well
+        if (pMember == member || !map->CanWriteNow(pMember) || !pMember->IsAlive() || !pMember->GetVictim())
         {
             continue;
         }
 
-        if (pMember == m_leader && !(groupAI & std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_MEMBER_ASSIST_LEADER)))
+        if (pMember == leader && !(groupAI & GroupFlag(GroupAIFlags::GROUP_AI_FLAG_MEMBER_ASSIST_LEADER)))
         {
             continue;
         }
@@ -288,59 +395,66 @@ Unit* CreatureGroup::GetNewTargetForMember(Creature* member)
 
 void CreatureGroup::MemberEvaded(Creature* member)
 {
-    uint8 const groupAI = sFormationMgr->CreatureGroupMap[member->GetSpawnId()].groupAI;
-    if (!(groupAI & std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_EVADE_MASK)))
+    uint16 const groupAI = GetGroupAI(member);
+    if (!(groupAI & GroupFlag(GroupAIFlags::GROUP_AI_FLAG_EVADE_MASK)))
     {
         return;
     }
 
     // Copy the member list first: Respawn() below takes the member out of the
     // world, which erases it from m_members and would invalidate this loop.
-    CreatureGroupMemberType members = m_members;
+    Creature* leader = nullptr;
+    MemberList const members = CopyMembers(&leader);
+    Map* map = member->GetMap();
+    uint32 const groupId = m_groupID;
 
     for (auto const& itr : members)
     {
         Creature* pMember = itr.first;
         // This should never happen
-        if (!pMember)
+        if (!pMember || pMember == member)
             continue;
 
-        // A previous member's Respawn() or EnterEvadeMode() may have removed
-        // this one from the group already.
-        if (pMember->GetFormation() != this)
+        uint16 const memberAI = itr.second.groupAI;
+        if (!(memberAI & GroupFlag(GroupAIFlags::GROUP_AI_FLAG_EVADE_MASK)))
             continue;
 
-        if (pMember == member || pMember->IsInEvadeMode() || !itr.second.HasGroupFlag(std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_EVADE_MASK)))
-            continue;
-
-        // EVADE_TOGETHER and RESPAWN_ON_EVADE are independent: living members evade, dead members respawn.
-        if (pMember->IsAlive())
+        // Evading or respawning ends the member's formation movement, which edits the leader's follower list
+        WriteMember(map, pMember, leader, groupId, [memberAI, groupId](Creature* creature, Unit* /*leader*/)
         {
-            if (!itr.second.HasGroupFlag(
-                    std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_EVADE_TOGETHER)))
-                continue;
+            // A previous member's Respawn() or EnterEvadeMode() may have removed
+            // this one from the group already.
+            if (!IsInGroup(creature, groupId) || creature->IsInEvadeMode())
+                return;
 
-            if (!pMember->IsInCombat())
-                continue;
+            // EVADE_TOGETHER and RESPAWN_ON_EVADE are independent: living members evade, dead members respawn.
+            if (creature->IsAlive())
+            {
+                if (!(memberAI & GroupFlag(GroupAIFlags::GROUP_AI_FLAG_EVADE_TOGETHER)))
+                    return;
 
-            if (pMember->IsAIEnabled)
-                if (CreatureAI* pMemberAI = pMember->AI())
-                    pMemberAI->EnterEvadeMode();
-        }
-        else
-        {
-            if (!itr.second.HasGroupFlag(
-                    std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_RESPAWN_ON_EVADE)))
-                continue;
+                if (!creature->IsInCombat())
+                    return;
 
-            if (itr.second.HasGroupFlag(std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_DONT_RESPAWN_LEADER_ON_EVADE)) && pMember == m_leader)
-                continue;
+                if (creature->IsAIEnabled)
+                    if (CreatureAI* creatureAI = creature->AI())
+                        creatureAI->EnterEvadeMode();
+            }
+            else
+            {
+                if (!(memberAI & GroupFlag(GroupAIFlags::GROUP_AI_FLAG_RESPAWN_ON_EVADE)))
+                    return;
 
-            pMember->Respawn();
-        }
+                if ((memberAI & GroupFlag(GroupAIFlags::GROUP_AI_FLAG_DONT_RESPAWN_LEADER_ON_EVADE)) &&
+                    creature->GetSpawnId() == groupId)
+                    return;
+
+                creature->Respawn();
+            }
+        });
     }
 
-    RespawnRemovedMembers(member->GetMap());
+    RespawnRemovedMembers(map);
 }
 
 // In dynamic respawn mode a creature is removed from the world once its corpse decays, and RemoveFromWorld drops it
@@ -352,14 +466,18 @@ void CreatureGroup::RespawnRemovedMembers(Map* map)
     if (membersItr == sFormationMgr->CreatureGroupMembers.end())
         return;
 
+    std::vector<ObjectGuid::LowType> inWorldSpawnIds;
+    {
+        std::lock_guard<Acore::SpinLock> guard(m_lock);
+        inWorldSpawnIds.reserve(m_members.size());
+        for (auto const& itr : m_members)
+            inWorldSpawnIds.push_back(itr.first->GetSpawnId());
+    }
+
     time_t now = GameTime::GetGameTime().count();
     for (ObjectGuid::LowType spawnId : membersItr->second)
     {
-        bool const inWorld = std::any_of(m_members.begin(), m_members.end(), [spawnId](auto const& itr)
-        {
-            return itr.first->GetSpawnId() == spawnId;
-        });
-        if (inWorld)
+        if (std::find(inWorldSpawnIds.begin(), inWorldSpawnIds.end(), spawnId) != inWorldSpawnIds.end())
             continue;
 
         auto const infoItr = sFormationMgr->CreatureGroupMap.find(spawnId);
@@ -367,11 +485,10 @@ void CreatureGroup::RespawnRemovedMembers(Map* map)
             continue;
 
         FormationInfo const& info = infoItr->second;
-        if (!info.HasGroupFlag(std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_RESPAWN_ON_EVADE)))
+        if (!info.HasGroupFlag(GroupFlag(GroupAIFlags::GROUP_AI_FLAG_RESPAWN_ON_EVADE)))
             continue;
 
-        if (spawnId == m_groupID && info.HasGroupFlag(
-                std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_DONT_RESPAWN_LEADER_ON_EVADE)))
+        if (spawnId == m_groupID && info.HasGroupFlag(GroupFlag(GroupAIFlags::GROUP_AI_FLAG_DONT_RESPAWN_LEADER_ON_EVADE)))
             continue;
 
         // Only creatures with a respawn still pending on this map: one without a stored time (alive, never loaded)
@@ -385,53 +502,78 @@ void CreatureGroup::RespawnRemovedMembers(Map* map)
 
 void CreatureGroup::FormationReset(bool dismiss, bool initMotionMaster)
 {
-    if (m_members.size() && !(m_members.begin()->second.HasGroupFlag(std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_FOLLOW_LEADER))))
+    Creature* leader = nullptr;
+    MemberList const members = CopyMembers(&leader);
+    if (!members.empty() && !members.front().second.HasGroupFlag(GroupFlag(GroupAIFlags::GROUP_AI_FLAG_FOLLOW_LEADER)))
         return;
 
-    for (auto const& itr : m_members)
+    if (initMotionMaster)
     {
-        Creature* member = itr.first;
-        if (member && member != m_leader && member->IsAlive())
+        for (auto const& itr : members)
         {
-            if (initMotionMaster)
-            {
-                if (dismiss)
-                    member->GetMotionMaster()->MovementExpiredOnSlot(MOTION_SLOT_IDLE, false);
-                else
-                    member->GetMotionMaster()->MoveIdle();
+            Creature* member = itr.first;
+            if (!member || member == leader)
+                continue;
 
-                LOG_DEBUG("entities.unit", "Set {} movement for member {}", dismiss ? "default" : "idle", member->GetGUID().ToString());
-            }
+            // Replacing the member's formation movement edits the leader's follower list
+            WriteMember(member->GetMap(), member, leader, m_groupID, [dismiss](Creature* creature, Unit* /*leader*/)
+            {
+                if (!creature->IsAlive())
+                    return;
+
+                if (dismiss)
+                    creature->GetMotionMaster()->MovementExpiredOnSlot(MOTION_SLOT_IDLE, false);
+                else
+                    creature->GetMotionMaster()->MoveIdle();
+
+                LOG_DEBUG("entities.unit", "Set {} movement for member {}", dismiss ? "default" : "idle", creature->GetGUID().ToString());
+            });
         }
     }
-    m_Formed = !dismiss;
+
+    m_Formed.store(!dismiss, std::memory_order_relaxed);
 }
 
 void CreatureGroup::LeaderStartedMoving()
 {
-    if (!m_leader)
+    Creature* leader = nullptr;
+    MemberList const members = CopyMembers(&leader);
+    if (!leader)
         return;
 
-    for (auto const& itr : m_members)
+    Map* map = leader->GetMap();
+    for (auto const& itr : members)
     {
         Creature* member = itr.first;
         FormationInfo const& pFormationInfo = itr.second;
-        if (member == m_leader || !member->IsAlive() || member->GetVictim() || !pFormationInfo.HasGroupFlag(std::underlying_type_t<GroupAIFlags>(GroupAIFlags::GROUP_AI_FLAG_FOLLOW_LEADER)))
+        if (member == leader || !pFormationInfo.HasGroupFlag(GroupFlag(GroupAIFlags::GROUP_AI_FLAG_FOLLOW_LEADER)))
             continue;
 
-        if (member->HasUnitState(UNIT_STATE_NOT_MOVE) || member->isPossessed() || member->HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED))
-            continue;
-
-        float const followAngle = pFormationInfo.follow_angle;
         float const followDist = pFormationInfo.follow_dist;
+        float const followAngle = pFormationInfo.follow_angle;
+        uint32 const point1 = pFormationInfo.point_1;
+        uint32 const point2 = pFormationInfo.point_2;
 
-        if (!member->HasUnitState(UNIT_STATE_FOLLOW_MOVE))
-            member->GetMotionMaster()->MoveFormation(m_leader, followDist, followAngle, pFormationInfo.point_1, pFormationInfo.point_2);
+        // MoveFormation registers the member as the leader's follower
+        WriteMember(map, member, leader, m_groupID,
+            [followDist, followAngle, point1, point2](Creature* creature, Unit* leaderUnit)
+        {
+            if (!leaderUnit || !creature->IsAlive() || creature->GetVictim())
+                return;
+
+            if (creature->HasUnitState(UNIT_STATE_NOT_MOVE) || creature->isPossessed() || creature->HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED))
+                return;
+
+            if (!creature->HasUnitState(UNIT_STATE_FOLLOW_MOVE))
+                creature->GetMotionMaster()->MoveFormation(leaderUnit, followDist, followAngle, point1, point2);
+        });
     }
 }
 
 bool CreatureGroup::CanLeaderStartMoving() const
 {
+    // Reads only: the members' state is read under the member lock, no member is called into for a write
+    std::lock_guard<Acore::SpinLock> guard(m_lock);
     for (auto const& itr : m_members)
     {
         if (itr.first && itr.first != m_leader && itr.first->IsAlive())
@@ -444,14 +586,32 @@ bool CreatureGroup::CanLeaderStartMoving() const
 
 void CreatureGroup::RemoveFormationMovement()
 {
-    for (auto const& itr : m_members)
+    Creature* leader = nullptr;
+    MemberList members = CopyMembers(&leader);
+    members.erase(std::remove_if(members.begin(), members.end(), [leader](auto const& itr)
+    {
+        return !itr.first || itr.first == leader;
+    }), members.end());
+
+    if (!members.empty())
+        ReleaseFollowers(members.front().first->GetMap(), m_groupID, leader, members);
+}
+
+// Ends the formation movement of followers (members other than leader, which can be out of the group already)
+void CreatureGroup::ReleaseFollowers(Map* map, uint32 groupId, Creature* leader, MemberList const& followers)
+{
+    for (auto const& itr : followers)
     {
         Creature* member = itr.first;
-        if (!member || member == m_leader)
+        if (!member || member == leader)
             continue;
 
-        if (member->GetMotionMaster()->GetMotionSlotType(MOTION_SLOT_IDLE) == FORMATION_MOTION_TYPE)
-            member->GetMotionMaster()->MovementExpiredOnSlot(MOTION_SLOT_IDLE, false);
+        // Expiring the member's formation movement edits the leader's follower list
+        WriteMember(map, member, leader, groupId, [](Creature* creature, Unit* /*leader*/)
+        {
+            if (creature->GetMotionMaster()->GetMotionSlotType(MOTION_SLOT_IDLE) == FORMATION_MOTION_TYPE)
+                creature->GetMotionMaster()->MovementExpiredOnSlot(MOTION_SLOT_IDLE, false);
+        });
     }
 }
 
@@ -459,12 +619,20 @@ void CreatureGroup::DespawnFormation(Milliseconds timeToDespawn /*=0ms*/, Second
 {
     // Copy the member list first: DespawnOrUnsummon() takes the member out of
     // the world, which erases it from m_members and would invalidate this loop.
-    CreatureGroupMemberType members = m_members;
+    Creature* leader = nullptr;
+    MemberList const members = CopyMembers(&leader);
 
     for (auto const& itr : members)
     {
-        if (itr.first && itr.first->GetFormation() == this)
-            itr.first->DespawnOrUnsummon(timeToDespawn, forcedRespawnTimer);
+        if (!itr.first)
+            continue;
+
+        // Despawning ends the member's formation movement, which edits the leader's follower list
+        WriteMember(itr.first->GetMap(), itr.first, itr.first != leader ? leader : nullptr, m_groupID,
+            [timeToDespawn, forcedRespawnTimer](Creature* creature, Unit* /*leader*/)
+        {
+            creature->DespawnOrUnsummon(timeToDespawn, forcedRespawnTimer);
+        });
     }
 }
 
@@ -472,19 +640,26 @@ void CreatureGroup::RespawnFormation(bool force)
 {
     // Copy the member list first: Respawn() takes the member out of the world,
     // which erases it from m_members and would invalidate this loop.
-    CreatureGroupMemberType members = m_members;
+    Creature* leader = nullptr;
+    MemberList const members = CopyMembers(&leader);
 
     for (auto const& itr : members)
     {
-        if (itr.first && itr.first->GetFormation() == this && !itr.first->IsAlive())
+        if (!itr.first)
+            continue;
+
+        WriteMember(itr.first->GetMap(), itr.first, itr.first != leader ? leader : nullptr, m_groupID,
+            [force](Creature* creature, Unit* /*leader*/)
         {
-            itr.first->Respawn(force);
-        }
+            if (!creature->IsAlive())
+                creature->Respawn(force);
+        });
     }
 }
 
 bool CreatureGroup::IsFormationInCombat()
 {
+    std::lock_guard<Acore::SpinLock> guard(m_lock);
     for (auto const& itr : m_members)
     {
         if (itr.first && itr.first->IsInCombat())
@@ -498,6 +673,7 @@ bool CreatureGroup::IsFormationInCombat()
 
 bool CreatureGroup::IsAnyMemberAlive(bool ignoreLeader /*= false*/)
 {
+    std::lock_guard<Acore::SpinLock> guard(m_lock);
     for (auto const& itr : m_members)
     {
         if (itr.first && itr.first->IsAlive())

@@ -20,7 +20,9 @@
 
 #include "Define.h"
 #include "ObjectGuid.h"
+#include "SpinLock.h"
 #include "Unit.h"
+#include <atomic>
 #include <map>
 #include <unordered_map>
 #include <vector>
@@ -89,6 +91,11 @@ public:
     void LoadCreatureFormations();
     CreatureGroupInfoType CreatureGroupMap;
     CreatureGroupMembersType CreatureGroupMembers;
+
+private:
+    // Guards the maps' CreatureGroupHolder and group creation/deletion: members of one group can be added and
+    // removed by different grid tasks of a parallel map phase
+    Acore::SpinLock _holderLock;
 };
 
 class CreatureGroup
@@ -96,6 +103,7 @@ class CreatureGroup
 public:
     // pussywizard: moved public to the top so it compiles and typedef is public
     typedef std::map<Creature*, FormationInfo>  CreatureGroupMemberType;
+    typedef std::vector<std::pair<Creature*, FormationInfo>> MemberList;
 
     //Group cannot be created empty
     explicit CreatureGroup(uint32 id) : m_leader(nullptr), m_groupID(id), m_Formed(false) {}
@@ -104,13 +112,21 @@ public:
     Creature* GetLeader() const { return m_leader; }
     uint32 GetId() const { return m_groupID; }
 
-    bool IsEmpty() const { return m_members.empty(); }
-    bool IsFormed() const { return m_Formed; }
+    bool IsEmpty() const;
+    bool IsFormed() const { return m_Formed.load(std::memory_order_relaxed); }
 
+    // Not synchronized: only for code that cannot run while another grid task of the map adds or removes members
     CreatureGroupMemberType const& GetMembers() const { return m_members; }
+    // Copy of the members (and the leader) taken under the member lock, for loops that call into members
+    MemberList CopyMembers(Creature** leader = nullptr) const;
 
     void AddMember(Creature* member);
+    // Removes member and returns true when the group is empty now. When member was the leader, followers receives
+    // the remaining members, whose formation movement the caller ends with ReleaseFollowers() outside any lock.
+    bool RemoveMember(Creature* member, MemberList& followers);
+    // Removes member and ends the followers' formation movement when it was the leader; the group is kept when empty
     void RemoveMember(Creature* member);
+    static void ReleaseFollowers(Map* map, uint32 groupId, Creature* leader, MemberList const& followers);
     void FormationReset(bool dismiss, bool initMotionMaster);
 
     void LeaderStartedMoving();
@@ -128,9 +144,12 @@ public:
 private:
     Creature* m_leader; //Important do not forget sometimes to work with pointers instead synonims :D:D
     CreatureGroupMemberType m_members;
+    // Guards m_members and m_leader: written by the members' tasks (AddMember / RemoveMember), read by the
+    // leader's and other members' tasks. Never held while calling into a member.
+    mutable Acore::SpinLock m_lock;
 
     uint32 m_groupID;
-    bool m_Formed;
+    std::atomic<bool> m_Formed;
 };
 
 #define sFormationMgr FormationMgr::instance()
