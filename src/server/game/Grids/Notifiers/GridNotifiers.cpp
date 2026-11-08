@@ -56,16 +56,12 @@ void VisibleNotifier::SendToSelf()
         }
     }
 
-    VisibleWorldObjectsMap* visibleWorldObjects = i_player.GetObjectVisibilityContainer().GetVisibleWorldObjectsMap();
-    for (VisibleWorldObjectsMap::iterator itr = visibleWorldObjects->begin(); itr != visibleWorldObjects->end();)
+    // Works on a snapshot of the visible objects, the container lock is never held while calling into other objects
+    i_player.GetObjectVisibilityContainer().ForEachVisibleWorldObject([this](WorldObject* obj)
     {
-        WorldObject* obj = itr->second;
         if (!i_player.IsWorldObjectOutOfSightRange(obj)
             || i_player.CanSeeOrDetect(obj, false, true))
-        {
-            ++itr;
-            continue;
-        }
+            return;
 
         i_data.AddOutOfRangeGUID(obj->GetGUID());
 
@@ -73,8 +69,8 @@ void VisibleNotifier::SendToSelf()
             objPlayer->UpdateVisibilityOf(&i_player);
 
         // Clean up references
-        itr = i_player.GetObjectVisibilityContainer().UnlinkVisibilityFromPlayer(obj, itr);
-    }
+        i_player.GetObjectVisibilityContainer().UnlinkWorldObjectVisibility(obj);
+    });
 
     if (!i_data.HasData())
         return;
@@ -198,20 +194,16 @@ void AIRelocationNotifier::Visit(PlayerMapType& m)
 }
 
 // Uses visibility map
-void MessageDistDeliverer::Visit(VisiblePlayersMap const& m)
+void MessageDistDeliverer::VisitVisiblePlayer(Player const* target) const
 {
-    for (auto const& kvPair : m)
-    {
-        Player const* target = kvPair.second;
-        if (i_distSq != 0.0f && target->GetSightPosition().GetExactDist2dSq(i_source) > i_distSq)
-            continue;
+    if (i_distSq != 0.0f && target->GetSightPosition().GetExactDist2dSq(i_source) > i_distSq)
+        return;
 
-        // @todo: Might not need this check anymore
-        if (skipped_receiver == target)
-            continue;
+    // @todo: Might not need this check anymore
+    if (skipped_receiver == target)
+        return;
 
-        target->SendDirectMessage(i_message);
-    }
+    target->SendDirectMessage(i_message);
 }
 
 void MessageDistDeliverer::Visit(PlayerMapType& m)

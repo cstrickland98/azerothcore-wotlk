@@ -581,25 +581,19 @@ public:
     void PlayDirectMusic(uint32 music_id, Player* target = nullptr);
     void PlayRadiusMusic(uint32 music_id, float radius);
 
-    // Warning: Possible iterator invalidation in uses that may modify visibility map
+    // Iterates a snapshot of the visibility map, the worker may modify visibility
     template<typename Worker>
     void DoForAllVisiblePlayers(Worker&& worker)
     {
-        for (auto const& kvPair : GetObjectVisibilityContainer().GetVisiblePlayersMap())
-            worker(kvPair.second);
+        GetObjectVisibilityContainer().ForEachVisiblePlayer(std::forward<Worker>(worker));
     }
 
-    // Warning: Possible iterator invalidation in uses that may modify visibility map
+    // Iterates a snapshot of the visibility map, the worker may modify visibility
+    // Does nothing for non-players
     template<typename Worker>
     void DoForAllVisibleWorldObjects(Worker&& worker)
     {
-        // Not a player, no access to this map
-        VisibleWorldObjectsMap const* visibleWorldObjectsMap = GetObjectVisibilityContainer().GetVisibleWorldObjectsMap();
-        if (!visibleWorldObjectsMap)
-            return;
-
-        for (auto const& kvPair : *visibleWorldObjectsMap)
-            worker(kvPair.second);
+        GetObjectVisibilityContainer().ForEachVisibleWorldObject(std::forward<Worker>(worker));
     }
 
     void DestroyForVisiblePlayers();

@@ -16891,17 +16891,28 @@ void Unit::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target)
 
     uint64 cacheKey = static_cast<uint64>(visibleFlag) << 8 | updateType;
 
-    auto cacheIt = _valuesUpdateCache.find(cacheKey);
-    if (cacheIt != _valuesUpdateCache.end())
+    // Copy the cached buffer out under the lock, no reference into the cache escapes it
+    bool cacheHit = false;
+    int32 cachedPos = 0;
+    BuildValuesCachePosPointers cachedAdjustedPos;
     {
-        int32 cachePos = static_cast<int32>(data->wpos());
-        data->append(cacheIt->second.buffer);
+        std::lock_guard<Acore::SpinLock> guard(_valuesUpdateCacheLock);
+        auto cacheIt = _valuesUpdateCache.find(cacheKey);
+        if (cacheIt != _valuesUpdateCache.end())
+        {
+            cacheHit = true;
+            cachedPos = static_cast<int32>(data->wpos());
+            data->append(cacheIt->second.buffer);
+            cachedAdjustedPos = cacheIt->second.posPointers;
+        }
+    }
 
-        BuildValuesCachePosPointers dataAdjustedPos = cacheIt->second.posPointers;
-        if (cachePos)
-            dataAdjustedPos.ApplyOffset(cachePos);
+    if (cacheHit)
+    {
+        if (cachedPos)
+            cachedAdjustedPos.ApplyOffset(cachedPos);
 
-        PatchValuesUpdate(*data, dataAdjustedPos, target);
+        PatchValuesUpdate(*data, cachedAdjustedPos, target);
 
         return;
     }
@@ -17000,6 +17011,7 @@ void Unit::BuildValuesUpdate(uint8 updateType, ByteBuffer* data, Player* target)
 
     PatchValuesUpdate(*data, dataAdjustedPos, target);
 
+    std::lock_guard<Acore::SpinLock> guard(_valuesUpdateCacheLock);
     _valuesUpdateCache.insert(std::pair<uint64, BuildValuesCachedBuffer>(cacheKey, std::move(cacheValue)));
 }
 

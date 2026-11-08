@@ -30,6 +30,7 @@
 #include "SpellDefines.h"
 #include "ThreatManager.h"
 #include "UnitDefines.h"
+#include "SpinLock.h"
 #include "UnitUtils.h"
 #include <array>
 #include <boost/container/flat_map.hpp>
@@ -2274,7 +2275,11 @@ private:
     [[nodiscard]] uint32 GetCombatRatingDamageReduction(CombatRating cr, float rate, float cap, uint32 damage) const;
 
     void PatchValuesUpdate(ByteBuffer& valuesUpdateBuf, BuildValuesCachePosPointers& posPointers, Player* target);
-    void InvalidateValuesUpdateCache() { _valuesUpdateCache.clear(); }
+    void InvalidateValuesUpdateCache()
+    {
+        std::lock_guard<Acore::SpinLock> guard(_valuesUpdateCacheLock);
+        _valuesUpdateCache.clear();
+    }
 
     [[nodiscard]] float processDummyAuras(float TakenTotalMod) const;
 
@@ -2313,6 +2318,8 @@ private:
 
     typedef std::unordered_map<uint64 /*visibleFlag(uint32) + updateType(uint8)*/, BuildValuesCachedBuffer>  ValuesUpdateCache;
     ValuesUpdateCache _valuesUpdateCache;
+    // BuildValuesUpdate runs in the map thread of every viewer, which may differ from ours
+    Acore::SpinLock _valuesUpdateCacheLock;
 };
 
 namespace Acore
