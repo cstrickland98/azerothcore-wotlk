@@ -85,7 +85,11 @@ Map* MapMgr::CreateBaseMap(uint32 id)
             if (entry->Instanceable())
                 map = new MapInstanced(id);
             else
+            {
                 map = new Map(id, 0, REGULAR_DIFFICULTY);
+                if (entry->IsWorldMap())
+                    map->SetThreadsPerMap(sWorld->getIntConfig(CONFIG_MAP_THREADS_PER_MAP));
+            }
 
             i_maps[id] = map;
 
