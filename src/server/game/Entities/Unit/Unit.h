@@ -34,6 +34,7 @@
 #include <array>
 #include <boost/container/flat_map.hpp>
 #include <functional>
+#include <mutex>
 #include <utility>
 
 #define WORLD_TRIGGER   12999
@@ -366,6 +367,8 @@ public:
     DamageInfo(CalcDamageInfo const& dmgInfo, uint8 damageIndex);
     DamageInfo(SpellNonMeleeDamage const& spellNonMeleeDamage, DamageEffectType damageType, WeaponAttackType attackType, uint32 hitMask);
     DamageInfo(SpellNonMeleeDamage const& spellNonMeleeDamage, DamageEffectType damageType, WeaponAttackType attackType, SpellMissInfo missInfo);
+    // Same values with other units, to carry a damage event into a deferred call without its pointers
+    DamageInfo(DamageInfo const& other, Unit* attacker, Unit* victim);
 
     void ModifyDamage(int32 amount);
     void AbsorbDamage(uint32 amount);
@@ -407,6 +410,14 @@ public:
     {
         m_absorb = 0;
         m_effectiveHeal = 0;
+    }
+
+    // Same values with other units, to carry a heal event into a deferred call without its pointers
+    HealInfo(HealInfo const& other, Unit* healer, Unit* target)
+        : m_healer(healer), m_target(target), m_heal(other.m_heal), m_healBeforeTakenMods(other.m_healBeforeTakenMods),
+          m_effectiveHeal(other.m_effectiveHeal), m_absorb(other.m_absorb), m_spellInfo(other.m_spellInfo),
+          m_schoolMask(other.m_schoolMask), m_hitMask(other.m_hitMask)
+    {
     }
 
     void AbsorbHeal(uint32 amount)
@@ -905,6 +916,12 @@ public:
     bool AttackStop();
     void RemoveAllAttackers();
     [[nodiscard]] AttackerSet const& getAttackers() const { return m_attackers; }
+    // Use where a far unit may attack or stop attacking this one: copies the set into `copy` under the link lock
+    // during a parallel map phase and returns it, otherwise returns the set itself
+    [[nodiscard]] AttackerSet const& GetAttackersForIteration(AttackerSet& copy) const;
+    // True while this unit's map runs a parallel phase; the cross-unit link sets then need GetLinkLock()
+    [[nodiscard]] bool IsLinkLockNeeded() const;
+    std::mutex& GetLinkLock() const { return _linkLock; }
     [[nodiscard]] bool GetMeleeAttackPoint(Unit* attacker, Position& pos);
     [[nodiscard]] bool isAttackingPlayer() const;
     [[nodiscard]] Unit* GetVictim() const { return m_attacking; }
@@ -2173,6 +2190,9 @@ protected:
 
     AttackerSet m_attackers;
     Unit* m_attacking;
+    // Guards m_attackers and the ThreatManager threatened-by-me map, which other units write.
+    // Lock order: hold at most one unit's link lock at a time and call nothing that can take another while held.
+    mutable std::mutex _linkLock;
 
     DeathState m_deathState;
     Milliseconds m_lastDeathTime{Milliseconds::min()};
@@ -2254,8 +2274,8 @@ private:
 
     [[nodiscard]] float processDummyAuras(float TakenTotalMod) const;
 
-    void _addAttacker(Unit* pAttacker) { m_attackers.insert(pAttacker); }   ///@note: Call only in Unit::Attack()
-    void _removeAttacker(Unit* pAttacker) { m_attackers.erase(pAttacker); } ///@note: Call only in Unit::AttackStop()
+    void _addAttacker(Unit* pAttacker);    ///@note: Call only in Unit::Attack()
+    void _removeAttacker(Unit* pAttacker); ///@note: Call only in Unit::AttackStop()
 
     //----------- Private variables ----------//
     uint32 m_state;                                     // Even derived shouldn't modify
