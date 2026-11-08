@@ -60,6 +60,7 @@ void Corpse::RemoveFromWorld()
     {
         auto storeGuard = GetMap()->LockObjectsStoreForWrite();
         GetMap()->GetObjectsStore().Remove<Corpse>(GetGUID());
+        GetMap()->NoteRemovedFromWorldDuringPhase(this);
     }
 
     WorldObject::RemoveFromWorld();

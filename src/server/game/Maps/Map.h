@@ -188,6 +188,7 @@ struct MapWorkerScratch
     // object can be freed before the phase ends (Item::SetState(ITEM_REMOVED))
     std::vector<std::pair<Object*, bool>> updateObjectLog;
     std::vector<WorldObject*> removeList;                   // AddObjectToRemoveList
+    std::vector<std::pair<ObjectGuid, WorldObject*>> removedThisTick;   // NoteRemovedFromWorldDuringPhase
     std::vector<Unit*> delayedVisibility;                   // registered this tick, carried to the next one
     std::vector<Unit*> delayedVisibilitySerial;             // bucketed units that left their task's grid
     std::vector<Creature*> creaturesToMove;
@@ -295,6 +296,12 @@ public:
     void SetThreadsPerMap(uint32 threads);
     // Grid of obj as the ownership rule sees it: a player's from its position, others' from their current cell
     static bool GetObjectGridCoord(WorldObject const* obj, int32& gridX, int32& gridY);
+    // Resolves a GUID on this map for a deferred op. Falls back to objects removed from the world during this
+    // tick's phases (still allocated until DelayedUpdate): those are out of world, check IsInWorld() before any
+    // write that assumes world membership.
+    WorldObject* FindObjectForDeferredOp(ObjectGuid guid);
+    // Called by the RemoveFromWorld overrides next to the objects store removal; no-op outside a parallel phase
+    void NoteRemovedFromWorldDuringPhase(WorldObject* obj);
 
     // some calls like isInWater should not use vmaps due to processor power
     // can return INVALID_HEIGHT if under z+2 z coord not found height
@@ -698,7 +705,7 @@ private:
     void RunGridTask(MapGridTask& task, uint32 workerIndex, uint32 t_diff, uint32 s_diff, bool recheck);
     void FinishPhase();
     void ForgetDelayedVisibility(Unit* unit);
-    WorldObject* FindObjectForDeferredOp(ObjectGuid const& guid);
+    void ForgetRemovedThisTick(WorldObject* obj);
     void LogThreadingStats();
 
     template<class T> void InitializeObject(T* obj);
@@ -850,6 +857,7 @@ private:
     std::vector<WorldObject*> _serialUpdatables;
     std::vector<Unit*> _serialDelayedVisibility;
     std::vector<WorldObject*> _updatableRemovals;
+    std::unordered_map<ObjectGuid, WorldObject*> _removedThisTick;   // see FindObjectForDeferredOp
     MapThreadingStats _threadingStats;
     uint32 _threadingStatsTimer{0};
 
