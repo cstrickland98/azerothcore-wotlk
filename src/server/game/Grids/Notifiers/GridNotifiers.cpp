@@ -65,8 +65,18 @@ void VisibleNotifier::SendToSelf()
 
         i_data.AddOutOfRangeGUID(obj->GetGUID());
 
+        // The other player may be far away: its visible set is only ever changed by its own task
         if (Player* objPlayer = obj->ToPlayer())
-            objPlayer->UpdateVisibilityOf(&i_player);
+        {
+            ObjectGuid const selfGuid = i_player.GetGUID();
+            i_player.GetMap()->RunOnOwner(objPlayer->GetGUID(), [selfGuid](WorldObject* other)
+            {
+                Player* otherPlayer = other->ToPlayer();
+                Player* self = ObjectAccessor::FindPlayer(selfGuid);
+                if (otherPlayer && self && self->IsInWorld() && self->FindMap() == otherPlayer->FindMap())
+                    otherPlayer->UpdateVisibilityOf(self);
+            });
+        }
 
         // Clean up references
         i_player.GetObjectVisibilityContainer().UnlinkWorldObjectVisibility(obj);
