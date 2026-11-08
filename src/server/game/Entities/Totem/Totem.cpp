@@ -175,6 +175,7 @@ void Totem::UnSummon(Milliseconds msTime)
                 if (Group* group = player->GetGroup())
                 {
                     Map* map = player->GetMap();
+                    std::lock_guard<std::recursive_mutex> guard(group->GetLock());
                     for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
                     {
                         Player* target = itr->GetSource();

@@ -2257,6 +2257,7 @@ Unit* Player::SelectCharmedAIGroupTarget(float distance) const
         return nullptr;
 
     Player* target = nullptr;
+    std::lock_guard<std::recursive_mutex> guard(group->GetLock());
     for (GroupReference const* itr = group->GetFirstMember(); itr; itr = itr->next())
     {
         Player* member = itr->GetSource();

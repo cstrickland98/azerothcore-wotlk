@@ -42,6 +42,7 @@ private:
     void _RewardReputation(Player* player);
     void _RewardKillCredit(Player* player);
     void _RewardPlayer(Player* player, bool isDungeon);
+    void _DeferRewardPlayer(Player* player, bool isDungeon);
     void _RewardGroup();
     uint8 _GetPlayerLevel(Player const* player);
 

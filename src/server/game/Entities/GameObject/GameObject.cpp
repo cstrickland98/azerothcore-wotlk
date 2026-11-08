@@ -1830,13 +1830,24 @@ void GameObject::Use(Unit* user)
 
                     if (Group* group = player->GetGroup())
                     {
+                        std::lock_guard<std::recursive_mutex> guard(group->GetLock());
                         for (GroupReference const* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
                         {
                             if (Player* member = itr->GetSource())
                             {
                                 if (member->IsAtGroupRewardDistance(this))
                                 {
-                                    member->KillCreditGO(info->entry, GetGUID());
+                                    // a dead member counts by its corpse, its ghost may be outside this task's area
+                                    // in a parallel map phase: credit it on its owner then
+                                    if (member->GetMap()->CanWriteNow(member))
+                                        member->KillCreditGO(info->entry, GetGUID());
+                                    else
+                                        member->GetMap()->RunOnOwner(member, [entry = info->entry, goGuid = GetGUID()](WorldObject* target)
+                                        {
+                                            if (Player* creditee = target->ToPlayer())
+                                                if (creditee->IsInWorld())
+                                                    creditee->KillCreditGO(entry, goGuid);
+                                        });
                                 }
                             }
                         }

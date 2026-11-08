@@ -19,6 +19,8 @@
 #include "Creature.h"
 #include "Formulas.h"
 #include "Group.h"
+#include "Map.h"
+#include "ObjectAccessor.h"
 #include "Pet.h"
 #include "Player.h"
 #include "ScriptMgr.h"
@@ -85,6 +87,8 @@ void KillRewarder::_InitGroupData()
 {
     if (_group)
     {
+        // Members invite / leave from their own map tasks; hold the group lock across the member walk.
+        std::lock_guard<std::recursive_mutex> guard(_group->GetLock());
         // 2. In case when player is in group, initialize variables necessary for group calculations:
         for (GroupReference* itr = _group->GetFirstMember(); itr != nullptr; itr = itr->next())
             if (Player* member = itr->GetSource())
@@ -262,13 +266,19 @@ void KillRewarder::_RewardGroup()
             }
 
             // 3.1.3. Reward each group member (even dead or corpse) within reward distance.
+            std::lock_guard<std::recursive_mutex> guard(_group->GetLock());
             for (GroupReference* itr = _group->GetFirstMember(); itr != nullptr; itr = itr->next())
             {
                 if (Player* member = itr->GetSource())
                 {
                     if (_killer == member || member->IsAtGroupRewardDistance(_victim))
                     {
-                        _RewardPlayer(member, isDungeon);
+                        // A dead member is in reward distance by its corpse, its ghost may be far away (graveyard):
+                        // in a parallel map phase reward it on the task owning it, from a copy of this rewarder.
+                        if (!member->GetMap()->CanWriteNow(member))
+                            _DeferRewardPlayer(member, isDungeon);
+                        else
+                            _RewardPlayer(member, isDungeon);
                         // Xinef: only count players
                         //if (_victim->IsPlayer())
                         //    member->UpdateAchievementCriteria(ACHIEVEMENT_CRITERIA_TYPE_SPECIAL_PVP_KILL, 1, 0, _victim);
@@ -277,6 +287,26 @@ void KillRewarder::_RewardGroup()
             }
         }
     }
+}
+
+void KillRewarder::_DeferRewardPlayer(Player* player, bool isDungeon)
+{
+    // The copy keeps the computed group data (xp, rates, counts); _group and _maxNotGrayMember are only tested
+    // against null on the reward path. The killer and the victim are looked up again on the owner side and the
+    // reward is skipped when either is gone, as _RewardPlayer needs both.
+    player->GetMap()->RunOnOwner(player, [rewarder = *this, killerGuid = _killer->GetGUID(), victimGuid = _victim->GetGUID(), isDungeon](WorldObject* obj) mutable
+    {
+        Player* member = obj->ToPlayer();
+        if (!member || !member->IsInWorld())
+            return;
+
+        rewarder._killer = ObjectAccessor::GetPlayer(*member, killerGuid);
+        rewarder._victim = ObjectAccessor::GetUnit(*member, victimGuid);
+        if (!rewarder._killer || !rewarder._victim)
+            return;
+
+        rewarder._RewardPlayer(member, isDungeon);
+    });
 }
 
 uint8 KillRewarder::_GetPlayerLevel(Player const* player)
