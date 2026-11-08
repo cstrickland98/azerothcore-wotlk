@@ -65,7 +65,32 @@ bool MapThreading::IsWritable(WorldObject const* obj)
     if (!Map::GetObjectGridCoord(obj, gridX, gridY))
         return true;
 
-    return std::abs(gridX - context.gridX) <= 1 && std::abs(gridY - context.gridY) <= 1;
+    if (gridX == context.gridX && gridY == context.gridY)
+        return true;
+
+    if (std::abs(gridX - context.gridX) > 1 || std::abs(gridY - context.gridY) > 1)
+        return false;
+
+    // A neighbour grid can touch two tasks of the running colour: each owns the half facing it
+    return IsPositionWritable(obj->GetPositionX(), obj->GetPositionY());
+}
+
+bool MapThreading::IsPositionWritable(float x, float y)
+{
+    Context const& context = CurrentContext;
+    if (!context.map || context.gridX < 0 || context.gridY < 0)
+        return true;
+
+    // Position in grid units, laid out as Acore::ComputeGridCoord: grid g spans [g, g + 1)
+    float const gridUnitsX = float(CENTER_GRID_ID) - x / SIZE_OF_GRIDS;
+    float const gridUnitsY = float(CENTER_GRID_ID) - y / SIZE_OF_GRIDS;
+
+    // Distance to the task grid's bounding box, in grid units
+    float const dx = std::max({ float(context.gridX) - gridUnitsX, 0.0f, gridUnitsX - float(context.gridX + 1) });
+    float const dy = std::max({ float(context.gridY) - gridUnitsY, 0.0f, gridUnitsY - float(context.gridY + 1) });
+
+    // Strictly under half a grid: two tasks of one colour are a full grid apart, their halves never meet
+    return dx * dx + dy * dy < 0.25f;
 }
 
 void MapThreading::ReportViolation(char const* site, WorldObject const* obj)
