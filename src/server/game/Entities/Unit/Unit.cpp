@@ -1016,8 +1016,26 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
         if (victim->IsAIEnabled)
             victim->GetAI()->DamageTaken(attacker, damage, damagetype, damageSchoolMask);
 
+        // a periodic tick can come from a far attacker, in another task's area: its AI hears of it there, unable to
+        // change the damage
         if (attacker && attacker->IsAIEnabled)
-            attacker->GetAI()->DamageDealt(victim, damage, damagetype, damageSchoolMask);
+        {
+            Map* map = victim->FindMap();
+            if (!map || map->CanWriteNow(attacker))
+                attacker->GetAI()->DamageDealt(victim, damage, damagetype, damageSchoolMask);
+            else
+                map->RunOnOwner(attacker, [victimGuid = victim->GetGUID(), damage, damagetype, damageSchoolMask](
+                    WorldObject* target)
+                {
+                    Unit* deferredAttacker = target->ToUnit();
+                    Unit* deferredVictim = ObjectAccessor::GetUnit(*target, victimGuid);
+                    if (!deferredAttacker || !deferredVictim || !deferredAttacker->IsAIEnabled)
+                        return;
+
+                    uint32 dealt = damage;
+                    deferredAttacker->GetAI()->DamageDealt(deferredVictim, dealt, damagetype, damageSchoolMask);
+                });
+        }
     }
 
     // Hook for OnDamage Event
@@ -1127,7 +1145,22 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
 
             // Shared damage is a hostile interaction for its recipient too.
             if (hasSharedDamage && attacker && !attacker->IsFriendlyTo(shareDamageTarget) && !skipCombat)
-                attacker->AtTargetAttacked(shareDamageTarget, !spellProto || spellProto->HasInitialAggro());
+            {
+                bool const canInitialAggro = !spellProto || spellProto->HasInitialAggro();
+                // AtTargetAttacked writes the attacker's PvP state; the attacker of a periodic tick can be far
+                Map* map = shareDamageTarget->FindMap();
+                if (!map || map->CanWriteNow(attacker))
+                    attacker->AtTargetAttacked(shareDamageTarget, canInitialAggro);
+                else
+                    map->RunOnOwner(attacker, [targetGuid = shareDamageTarget->GetGUID(), canInitialAggro](
+                        WorldObject* target)
+                    {
+                        Unit* deferredAttacker = target->ToUnit();
+                        Unit* deferredTarget = ObjectAccessor::GetUnit(*target, targetGuid);
+                        if (deferredAttacker && deferredTarget)
+                            deferredAttacker->AtTargetAttacked(deferredTarget, canInitialAggro);
+                    });
+            }
 
             Unit::DealDamage(attacker, shareDamageTarget, shareDamage, cleanDamage, NODAMAGE, damageSchoolMask,
                 spellProto, false, false, damageSpell, skipCombat);
@@ -1313,11 +1346,19 @@ uint32 Unit::DealDamage(Unit* attacker, Unit* victim, uint32 damage, CleanDamage
 
         if (attacker && attacker->IsPlayer())
         {
-            // random durability for items (HIT DONE)
+            // random durability for items (HIT DONE); the attacker of a periodic tick can be far
             if (roll_chance_f(sWorld->getRate(RATE_DURABILITY_LOSS_DAMAGE)))
             {
                 EquipmentSlots slot = EquipmentSlots(urand(0, EQUIPMENT_SLOT_END - 1));
-                attacker->ToPlayer()->DurabilityPointLossForEquipSlot(slot);
+                Map* map = victim->FindMap();
+                if (!map || map->CanWriteNow(attacker))
+                    attacker->ToPlayer()->DurabilityPointLossForEquipSlot(slot);
+                else
+                    map->RunOnOwner(attacker, [slot](WorldObject* target)
+                    {
+                        if (Player* player = target->ToPlayer())
+                            player->DurabilityPointLossForEquipSlot(slot);
+                    });
             }
         }
 
@@ -10591,6 +10632,9 @@ void Unit::SetImmuneToPC(bool apply, bool keepCombat)
         SetUnitFlag(UNIT_FLAG_IMMUNE_TO_PC);
         if (!keepCombat)
         {
+            if (m_combatManager.DeferCombatEnd([](Unit* unit) { unit->SetImmuneToPC(true, false); }))
+                return;
+
             std::vector<CombatReference*> toEnd;
             for (auto const& pair : m_combatManager.GetPvECombatRefs())
                 if (pair.second->GetOther(this)->HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED))
@@ -10612,6 +10656,9 @@ void Unit::SetImmuneToNPC(bool apply, bool keepCombat)
         SetUnitFlag(UNIT_FLAG_IMMUNE_TO_NPC);
         if (!keepCombat)
         {
+            if (m_combatManager.DeferCombatEnd([](Unit* unit) { unit->SetImmuneToNPC(true, false); }))
+                return;
+
             std::vector<CombatReference*> toEnd;
             for (auto const& pair : m_combatManager.GetPvECombatRefs())
                 if (!pair.second->GetOther(this)->HasUnitFlag(UNIT_FLAG_PLAYER_CONTROLLED))
@@ -10626,6 +10673,10 @@ void Unit::SetImmuneToNPC(bool apply, bool keepCombat)
 
 void Unit::ClearInCombat(bool keepPvPForOthers)
 {
+    // deferred whole: clearing the combat flag now would hide the combat exit from the deferred end
+    if (m_combatManager.DeferCombatEnd([keepPvPForOthers](Unit* unit) { unit->ClearInCombat(keepPvPForOthers); }))
+        return;
+
     m_CombatTimer = 0;
     // Let CombatManager handle flag removal through UpdateOwnerCombatState
     // so that AtExitCombat/AtDisengage callbacks properly fire.
@@ -15981,19 +16032,24 @@ void Unit::StopAttackFaction(uint32 faction_id)
         }
     }
 
-    // Collect GUIDs, not pointers: EndCombat can cascade through AI callbacks
-    // (formation MemberEvaded -> CombatStop) and free other refs in the list.
-    std::vector<ObjectGuid> guidsToEnd;
-    for (auto const& pair : m_combatManager.GetPvECombatRefs())
-        if (pair.second->GetOther(this)->GetFactionTemplateEntry()->faction == faction_id)
-            guidsToEnd.push_back(pair.first);
-    for (ObjectGuid const& guid : guidsToEnd)
+    auto endFactionCombat = [faction_id](Unit* unit)
     {
-        auto const& refs = m_combatManager.GetPvECombatRefs();
-        auto it = refs.find(guid);
-        if (it != refs.end())
-            it->second->EndCombat();
-    }
+        // Collect GUIDs, not pointers: EndCombat can cascade through AI callbacks
+        // (formation MemberEvaded -> CombatStop) and free other refs in the list.
+        std::vector<ObjectGuid> guidsToEnd;
+        for (auto const& pair : unit->m_combatManager.GetPvECombatRefs())
+            if (pair.second->GetOther(unit)->GetFactionTemplateEntry()->faction == faction_id)
+                guidsToEnd.push_back(pair.first);
+        for (ObjectGuid const& guid : guidsToEnd)
+        {
+            auto const& refs = unit->m_combatManager.GetPvECombatRefs();
+            auto it = refs.find(guid);
+            if (it != refs.end())
+                it->second->EndCombat();
+        }
+    };
+    if (!m_combatManager.DeferCombatEnd(endFactionCombat))
+        endFactionCombat(this);
 
     for (ControlSet::const_iterator itr = m_Controlled.begin(); itr != m_Controlled.end(); ++itr)
         (*itr)->StopAttackFaction(faction_id);

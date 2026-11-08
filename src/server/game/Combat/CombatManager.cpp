@@ -75,6 +75,9 @@
 
 void CombatReference::EndCombat()
 {
+    MT_ASSERT_WRITABLE(first);
+    MT_ASSERT_WRITABLE(second);
+
     // sequencing matters here - AI might do nasty stuff, so make sure refs are in a consistent state before you hand off!
 
     // first, get rid of any threat that still exists...
@@ -164,18 +167,59 @@ void CombatManager::Update(uint32 tdiff)
             _evadeTimer -= tdiff;
     }
 
+    Map* map = _owner->FindMap();
+    bool const parallelPhase = map && map->IsParallelPhase();
     auto it = _pvpRefs.begin(), end = _pvpRefs.end();
     while (it != end)
     {
         PvPCombatReference* const ref = it->second;
         if (ref->first == _owner && !ref->Update(tdiff)) // only update if we're the first unit involved (otherwise double decrement)
         {
+            // the other unit is outside the running task's area: the expired reference ends in the serial step
+            if (parallelPhase && !map->CanWriteNow(ref->second))
+            {
+                map->RunOnOwner(_owner->GetGUID(), [otherGuid = it->first](WorldObject* target)
+                {
+                    Unit* unit = target->ToUnit();
+                    if (!unit)
+                        return;
+
+                    auto const& refs = unit->GetCombatManager()._pvpRefs;
+                    if (PvPCombatReference* expired = Acore::Containers::MapGetValuePtr(refs, otherGuid))
+                        expired->EndCombat();
+                });
+                ++it;
+                continue;
+            }
+
             it = _pvpRefs.erase(it), end = _pvpRefs.end(); // remove it from our refs first to prevent invalidation
             ref->EndCombat(); // this will remove it from the other side
         }
         else
             ++it;
     }
+}
+
+bool CombatManager::DeferCombatEnd(std::function<void(Unit*)> fn) const
+{
+    Map* map = _owner->FindMap();
+    if (!map || !map->IsParallelPhase())
+        return false;
+
+    bool anyFar = !map->CanWriteNow(_owner);
+    for (auto const& pair : _pveRefs)
+        anyFar = anyFar || !map->CanWriteNow(pair.second->GetOther(_owner));
+    for (auto const& pair : _pvpRefs)
+        anyFar = anyFar || !map->CanWriteNow(pair.second->GetOther(_owner));
+    if (!anyFar)
+        return false;
+
+    map->RunOnOwner(_owner->GetGUID(), [fn](WorldObject* target)
+    {
+        if (Unit* unit = target->ToUnit())
+            fn(unit);
+    });
+    return true;
 }
 
 bool CombatManager::HasPvECombat() const
@@ -312,6 +356,13 @@ void CombatManager::InheritCombatStatesFrom(Unit const* who)
 
 void CombatManager::EndCombatBeyondRange(float range, bool includingPvP)
 {
+    auto deferred = [range, includingPvP](Unit* unit)
+    {
+        unit->GetCombatManager().EndCombatBeyondRange(range, includingPvP);
+    };
+    if (DeferCombatEnd(deferred))
+        return;
+
     auto it = _pveRefs.begin(), end = _pveRefs.end();
     while (it != end)
     {
@@ -359,6 +410,9 @@ void CombatManager::RestartPvPCombatTimers()
 
 void CombatManager::EndAllPvECombat()
 {
+    if (DeferCombatEnd([](Unit* unit) { unit->GetCombatManager().EndAllPvECombat(); }))
+        return;
+
     // cannot have threat without combat
     _owner->GetThreatMgr().RemoveMeFromThreatLists();
     _owner->GetThreatMgr().ClearAllThreat();
@@ -368,6 +422,9 @@ void CombatManager::EndAllPvECombat()
 
 void CombatManager::RevalidateCombat()
 {
+    if (DeferCombatEnd([](Unit* unit) { unit->GetCombatManager().RevalidateCombat(); }))
+        return;
+
     // EndCombat's combat-exit handling (AI, scripts, aura removal) can end or create more of our refs, so no
     // iterator may be held across it: collect the invalid guids first, then look each one up again
     auto endInvalidCombat = [this](auto& refs)
@@ -389,6 +446,9 @@ void CombatManager::RevalidateCombat()
 
 void CombatManager::EndAllPvPCombat()
 {
+    if (DeferCombatEnd([](Unit* unit) { unit->GetCombatManager().EndAllPvPCombat(); }))
+        return;
+
     while (!_pvpRefs.empty())
         _pvpRefs.begin()->second->EndCombat();
 }

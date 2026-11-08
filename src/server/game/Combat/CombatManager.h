@@ -21,6 +21,7 @@
 #include "Common.h"
 #include "ObjectGuid.h"
 #include "Position.h"
+#include <functional>
 #include <unordered_map>
 
 class Unit;
@@ -153,6 +154,12 @@ public:
     void RevalidateCombat();
     void EndAllPvPCombat();
     void EndAllCombat() { EndAllPvECombat(); EndAllPvPCombat(); }
+
+    // Ending combat writes both units and frees the shared reference. In a parallel map phase, when the owner or any
+    // unit it is in combat with is outside the running task's area, the whole call is deferred: DeferCombatEnd returns
+    // true after queueing fn(owner) for the serial step, where everything is writable. Combat then ends up to one phase
+    // later. Outside a phase it returns false and the caller goes straight through.
+    bool DeferCombatEnd(std::function<void(Unit*)> fn) const;
 
     CombatManager(CombatManager const&) = delete;
     CombatManager& operator=(CombatManager const&) = delete;
