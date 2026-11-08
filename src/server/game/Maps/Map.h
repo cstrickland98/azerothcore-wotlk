@@ -302,6 +302,8 @@ public:
     WorldObject* FindObjectForDeferredOp(ObjectGuid guid);
     // Called by the RemoveFromWorld overrides next to the objects store removal; no-op outside a parallel phase
     void NoteRemovedFromWorldDuringPhase(WorldObject* obj);
+    // Drops unit from the delayed visibility set carried across ticks (MapUpdate.ThreadsPerMap > 1)
+    void ForgetDelayedVisibility(Unit* unit);
 
     // some calls like isInWater should not use vmaps due to processor power
     // can return INVALID_HEIGHT if under z+2 z coord not found height
@@ -704,7 +706,6 @@ private:
     void BuildGridTasks(bool fullTick);
     void RunGridTask(MapGridTask& task, uint32 workerIndex, uint32 t_diff, uint32 s_diff, bool recheck);
     void FinishPhase();
-    void ForgetDelayedVisibility(Unit* unit);
     void ForgetRemovedThisTick(WorldObject* obj);
     void LogThreadingStats();
 
