@@ -1876,13 +1876,7 @@ public:
     PvPInfo pvpInfo;
     void UpdatePvPState();
     void UpdateFFAPvPState(bool reset = true);
-    void SetPvP(bool state)
-    {
-        Unit::SetPvP(state);
-        if (!m_Controlled.empty())
-            for (auto& itr : m_Controlled)
-                itr->SetPvP(state);
-    }
+    void SetPvP(bool state);
     void UpdatePvP(bool state, bool _override = false);
     void UpdateZone(uint32 newZone, uint32 newArea, bool force = false);
     void UpdateArea(uint32 newArea);
