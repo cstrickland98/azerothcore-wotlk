@@ -236,9 +236,13 @@ void TempSummon::InitStats(uint32 duration)
         {
             if (owner->m_SummonSlot[slot] && owner->m_SummonSlot[slot] != GetGUID())
             {
-                Creature* oldSummon = GetMap()->GetCreature(owner->m_SummonSlot[slot]);
-                if (oldSummon && oldSummon->IsSummon())
-                    oldSummon->ToTempSummon()->UnSummon();
+                // The old summon may sit far from where the owner stands now: unsummon it on its own task
+                GetMap()->RunOnOwner(owner->m_SummonSlot[slot], [](WorldObject* oldSummon)
+                {
+                    if (Creature* creature = oldSummon->ToCreature())
+                        if (creature->IsSummon())
+                            creature->ToTempSummon()->UnSummon();
+                });
             }
             owner->m_SummonSlot[slot] = GetGUID();
         }
