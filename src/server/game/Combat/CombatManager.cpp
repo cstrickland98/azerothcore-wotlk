@@ -135,7 +135,10 @@ void CombatReference::SuppressFor(Unit* who)
 bool PvPCombatReference::Update(uint32 tdiff)
 {
     if (_combatTimer <= tdiff)
+    {
+        _combatTimer = 0;
         return false;
+    }
     _combatTimer -= tdiff;
     return true;
 }
@@ -178,15 +181,19 @@ void CombatManager::Update(uint32 tdiff)
             // the other unit is outside the running task's area: the expired reference ends in the serial step
             if (parallelPhase && !map->CanWriteNow(ref->second))
             {
-                map->RunOnOwner(_owner->GetGUID(), [otherGuid = it->first](WorldObject* target)
+                // queued unconditionally: RunOnOwner on the (writable) owner would run it inline
+                map->DeferToPhaseEnd([map, ownerGuid = _owner->GetGUID(), otherGuid = it->first]()
                 {
-                    Unit* unit = target->ToUnit();
+                    WorldObject* target = map->FindObjectForDeferredOp(ownerGuid);
+                    Unit* unit = target ? target->ToUnit() : nullptr;
                     if (!unit)
                         return;
 
+                    // combat may have been refreshed since the phase saw the timer run out: end only if still expired
                     auto const& refs = unit->GetCombatManager()._pvpRefs;
                     if (PvPCombatReference* expired = Acore::Containers::MapGetValuePtr(refs, otherGuid))
-                        expired->EndCombat();
+                        if (expired->first == unit && expired->IsExpired())
+                            expired->EndCombat();
                 });
                 ++it;
                 continue;
@@ -206,7 +213,16 @@ bool CombatManager::DeferCombatEnd(std::function<void(Unit*)> fn) const
     if (!map || !map->IsParallelPhase())
         return false;
 
-    bool anyFar = !map->CanWriteNow(_owner);
+    // Only a worker of this map can queue for its serial step; anything else goes straight through as before
+    if (MapThreading::Current().map != map)
+        return false;
+
+    if (_pveRefs.empty() && _pvpRefs.empty())
+        return false;
+
+    // A unit leaving the world (CleanupBeforeRemoveFromMap) never ends combat from its own thread: its partners are
+    // handled in the serial step, where the unit still resolves through the removed-this-tick fallback
+    bool anyFar = !_owner->IsInWorld() || _owner->IsDuringRemoveFromWorld() || !map->CanWriteNow(_owner);
     for (auto const& pair : _pveRefs)
         anyFar = anyFar || !map->CanWriteNow(pair.second->GetOther(_owner));
     for (auto const& pair : _pvpRefs)
@@ -214,10 +230,13 @@ bool CombatManager::DeferCombatEnd(std::function<void(Unit*)> fn) const
     if (!anyFar)
         return false;
 
-    map->RunOnOwner(_owner->GetGUID(), [fn](WorldObject* target)
+    // Always queued, never run inline: running fn now would only call back into here. The serial step runs outside
+    // the phase, so fn goes straight through there; EndCombat does not need the owner to be in the world.
+    map->DeferToPhaseEnd([map, ownerGuid = _owner->GetGUID(), fn = std::move(fn)]()
     {
-        if (Unit* unit = target->ToUnit())
-            fn(unit);
+        if (WorldObject* target = map->FindObjectForDeferredOp(ownerGuid))
+            if (Unit* unit = target->ToUnit())
+                fn(unit);
     });
     return true;
 }
