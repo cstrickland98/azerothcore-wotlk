@@ -20,6 +20,7 @@
 #include "GameObjectAI.h"
 #include "Log.h"
 #include "Map.h"
+#include "MapThreading.h"
 #include "ObjectAccessor.h"
 #include "Pet.h"
 #include "Player.h"
@@ -296,9 +297,25 @@ void TempSummon::SetTempSummonType(TempSummonType type)
 
 void TempSummon::UnSummon(Milliseconds msTime)
 {
+    // Called from another unit's update (summon lists, SmartAI stored targets, scripts) this summon can be far,
+    // in another task's area of a parallel map phase: both the delayed event and the immediate unsummon write it,
+    // so they run on its owner (the serial step after the phase), looked up again by GUID.
+    if (Map* map = FindMap(); map && map->IsParallelPhase() && !map->CanWriteNow(this))
+    {
+        map->RunOnOwner(this, [msTime](WorldObject* target)
+        {
+            if (Creature* creature = target->ToCreature())
+                if (creature->IsInWorld())
+                    if (TempSummon* summon = creature->ToTempSummon())
+                        summon->UnSummon(msTime);
+        });
+        return;
+    }
+
     if (msTime > 0ms)
     {
         ForcedUnsummonDelayEvent* pEvent = new ForcedUnsummonDelayEvent(*this);
+        MT_ASSERT_WRITABLE(this);
         m_Events.AddEventAtOffset(pEvent, msTime);
         return;
     }
