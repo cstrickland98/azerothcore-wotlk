@@ -8029,6 +8029,10 @@ void Unit::SetMinion(Minion* minion, bool apply)
             return;
         }
 
+        // detached already: this unit left the world while the minion was far, see RemoveAllControlled
+        if (m_Controlled.find(minion) == m_Controlled.end())
+            return;
+
         m_Controlled.erase(minion);
 
         if (minion->m_Properties && minion->m_Properties->Type == SUMMON_TYPE_MINIPET)
@@ -8366,15 +8370,25 @@ void Unit::RemoveAllControlled(bool onDeath /*= false*/)
     if (IsPlayer())
         ToPlayer()->StopCastingCharm();
 
+    Map* map = FindMap();
     for (auto it = m_Controlled.begin(); it != m_Controlled.end();)
     {
         Unit* target = *it;
         ++it;
 
+        // a controlled unit can be far, in another task's area of a parallel map phase
+        bool const farTarget = map && !map->CanWriteNow(target);
         if (target->GetCharmerGUID() == GetGUID())
         {
             m_Controlled.erase(target);
-            target->RemoveCharmAuras();
+            if (farTarget)
+                map->RunOnOwner(target, [](WorldObject* obj)
+                {
+                    if (Unit* charm = obj->ToUnit())
+                        charm->RemoveCharmAuras();
+                });
+            else
+                target->RemoveCharmAuras();
         }
         else if (target->GetOwnerGUID() == GetGUID() && target->IsSummon())
         {
@@ -8385,7 +8399,15 @@ void Unit::RemoveAllControlled(bool onDeath /*= false*/)
                         continue;
 
             if (!(onDeath && !IsPlayer() && target->IsGuardian()))
+            {
+                // runs on the summon's owner when it is far
                 target->ToTempSummon()->UnSummon();
+                // This unit may have left the world by then (a far teleport removes a player from its old map at
+                // once), and the summon then finds no owner to detach from: detach it here, where this unit is
+                // writable, so m_Controlled never outlives the summon. SetMinion(false) only reads the minion.
+                if (farTarget && target->HasUnitTypeMask(UNIT_MASK_MINION | UNIT_MASK_GUARDIAN))
+                    SetMinion(static_cast<Minion*>(target), false);
+            }
         }
         else
         {
@@ -8505,6 +8527,7 @@ void Unit::UnsummonAllTotems(bool onDeath /*= false*/)
                     if (GetMap()->CanWriteNow(OldTotem))
                         OldTotem->ToTempSummon()->UnSummon();
                     else
+                    {
                         GetMap()->RunOnOwner(OldTotem, [](WorldObject* target)
                         {
                             if (Creature* creature = target->ToCreature())
@@ -8512,6 +8535,10 @@ void Unit::UnsummonAllTotems(bool onDeath /*= false*/)
                                     if (summon->IsInWorld())
                                         summon->UnSummon();
                         });
+                        // the totem clears the slot through its owner when it leaves the world, which finds nobody
+                        // once this unit has left the map (far teleport): clear it now
+                        m_SummonSlot[i].Clear();
+                    }
                 }
             }
         }
