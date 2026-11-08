@@ -21,6 +21,7 @@
 #include "GameTime.h"
 #include "GridNotifiers.h"
 #include "Log.h"
+#include "Map.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
@@ -412,6 +413,7 @@ Aura::~Aura()
         delete m_effects[i];
 
     ASSERT(m_applications.empty());
+    ASSERT(!m_pendingRemoteUnapplies);
     _DeleteRemovedApplications();
 }
 
@@ -451,10 +453,13 @@ void Aura::_ApplyForTarget(Unit* target, Unit* caster, AuraApplication* auraApp)
 {
     ASSERT(target);
     ASSERT(auraApp);
-    // aura mustn't be already applied on target
-    ASSERT (!IsAppliedOnTarget(target->GetGUID()) && "Aura::_ApplyForTarget: aura musn't be already applied on target");
+    {
+        std::lock_guard<Acore::SpinLock> guard(m_applicationsLock);
+        // aura mustn't be already applied on target
+        ASSERT (m_applications.find(target->GetGUID()) == m_applications.end() && "Aura::_ApplyForTarget: aura musn't be already applied on target");
 
-    m_applications[target->GetGUID()] = auraApp;
+        m_applications[target->GetGUID()] = auraApp;
+    }
     InvalidateStaticOnOwner();
 
     // set infinity cooldown state for spells
@@ -477,21 +482,29 @@ void Aura::_UnapplyForTarget(Unit* target, Unit* caster, AuraApplication* auraAp
     ASSERT(auraApp->GetRemoveMode());
     ASSERT(auraApp);
 
-    ApplicationMap::iterator itr = m_applications.find(target->GetGUID());
+    // called on the target's task; the owner may be updated by another task at the same time
+    bool found = false;
+    {
+        std::lock_guard<Acore::SpinLock> guard(m_applicationsLock);
+        ApplicationMap::iterator itr = m_applications.find(target->GetGUID());
+        if (itr != m_applications.end())
+        {
+            // aura has to be already applied
+            ASSERT(itr->second == auraApp);
+            m_applications.erase(itr);
+            m_removedApplications.push_back(auraApp);
+            found = true;
+        }
+    }
 
     /// @todo: Figure out why this happens
-    if (itr == m_applications.end())
+    if (!found)
     {
         LOG_ERROR("spells.aura", "Aura::_UnapplyForTarget, target:{}, caster:{}, spell:{} was not found in owners application map!",
                        target->GetGUID().ToString(), caster ? caster->GetGUID().ToString() : "", auraApp->GetBase()->GetSpellInfo()->Id);
         ABORT();
     }
 
-    // aura has to be already applied
-    ASSERT(itr->second == auraApp);
-    m_applications.erase(itr);
-
-    m_removedApplications.push_back(auraApp);
     InvalidateStaticOnOwner();
 
     // reset cooldown state for spells
@@ -535,14 +548,67 @@ void Aura::_Remove(AuraRemoveMode removeMode)
 {
     ASSERT (!m_isRemoved);
     m_isRemoved = true;
-    ApplicationMap::iterator appItr = m_applications.begin();
-    for (appItr = m_applications.begin(); appItr != m_applications.end();)
+    // Unapplying may cascade into other applications of this aura, so restart from the first
+    // remaining one each time. Applications whose target the running map task may not write are
+    // unapplied in the phase's serial step instead (and skipped here); single-threaded `queued`
+    // stays empty and this is the plain "unapply begin() until empty" loop.
+    std::vector<AuraApplication*> queued;
+    for (;;)
     {
-        AuraApplication* aurApp = appItr->second;
+        AuraApplication* aurApp = nullptr;
+        {
+            std::lock_guard<Acore::SpinLock> guard(m_applicationsLock);
+            for (ApplicationMap::value_type const& app : m_applications)
+            {
+                if (std::find(queued.begin(), queued.end(), app.second) == queued.end())
+                {
+                    aurApp = app.second;
+                    break;
+                }
+            }
+        }
+
+        if (!aurApp)
+            break;
+
         Unit* target = aurApp->GetTarget();
+        if (!CanWriteTargetNow(target))
+        {
+            QueueRemoteUnapply(aurApp, removeMode);
+            queued.push_back(aurApp);
+            continue;
+        }
+
         target->_UnapplyAura(aurApp, removeMode);
-        appItr = m_applications.begin();
     }
+}
+
+bool Aura::CanWriteTargetNow(Unit const* target) const
+{
+    Map* map = GetOwner()->FindMap();
+    return !map || map->CanWriteNow(target);
+}
+
+// Lifetime: aurApp stays allocated until this aura's _DeleteRemovedApplications (owner task), and the
+// aura itself until its owner deletes it, which Unit::_DeleteRemovedAuras postpones while
+// m_pendingRemoteUnapplies != 0 (a DynamicObject keeps its removed aura until it is destroyed outside
+// any phase). The op checks that aurApp is still this aura's application of the target before touching
+// it: the target may have removed it itself in the meantime.
+void Aura::QueueRemoteUnapply(AuraApplication* aurApp, AuraRemoveMode removeMode)
+{
+    Unit* target = aurApp->GetTarget();
+    Map* map = GetOwner()->GetMap();
+    ++m_pendingRemoteUnapplies;
+    map->RunOnOwner(target, [this, aurApp, removeMode](WorldObject* obj)
+    {
+        Unit* unit = obj->ToUnit();
+        if (!unit || GetApplicationOfTarget(unit->GetGUID()) != aurApp || aurApp->GetRemoveMode())
+            return;
+
+        unit->_UnapplyAura(aurApp, removeMode);
+    });
+    // deferred ops run in queue order: this runs after the unapply above (or in its place when the target is gone)
+    map->DeferToPhaseEnd([this]() { --m_pendingRemoteUnapplies; });
 }
 
 // paladin auras of the same spell may coexist on a target (one per caster) so Aura Mastery works
@@ -602,9 +668,16 @@ void Aura::UpdateTargetMap(Unit* caster, bool apply)
     // {owner, GetEffectMask()} for SPELL_EFFECT_APPLY_AURA effects, so the generic pass below finds the
     // owner's application, compares the same masks and only removes it if CanBeAppliedOn fails; nothing
     // is added. Do exactly that check without building the target map.
-    if (GetType() == UNIT_AURA_TYPE && m_applications.size() == 1 && IsOwnerOnlyUnitAura())
+    AuraApplication* ownerApp = nullptr;
+    if (GetType() == UNIT_AURA_TYPE)
     {
-        AuraApplication* ownerApp = m_applications.begin()->second;
+        std::lock_guard<Acore::SpinLock> guard(m_applicationsLock);
+        if (m_applications.size() == 1)
+            ownerApp = m_applications.begin()->second;
+    }
+
+    if (ownerApp && IsOwnerOnlyUnitAura())
+    {
         Unit* target = ownerApp->GetTarget();
         if (target == GetOwner() && ownerApp->GetEffectMask() == GetEffectMask())
         {
@@ -623,8 +696,24 @@ void Aura::UpdateTargetMap(Unit* caster, bool apply)
     UnitList targetsToRemove;
 
     // mark all auras as ready to remove
-    for (ApplicationMap::iterator appIter = m_applications.begin(); appIter != m_applications.end(); ++appIter)
+    // (on a copy: a far target's task may unapply its application concurrently; the pointers stay
+    // valid until our own _DeleteRemovedApplications)
+    ApplicationMap applications = GetApplicationMap();
+    for (ApplicationMap::iterator appIter = applications.begin(); appIter != applications.end(); ++appIter)
     {
+        // a target the running map task may not write (e.g. it teleported away from an area aura's
+        // owner): remove it in the phase's serial step if it left the area, otherwise leave it as it
+        // is; either way do not touch, re-add or re-remove it in this call
+        if (!CanWriteTargetNow(appIter->second->GetTarget()))
+        {
+            std::map<Unit*, uint8>::iterator existing = targets.find(appIter->second->GetTarget());
+            if (existing == targets.end())
+                QueueRemoteUnapply(appIter->second, AURA_REMOVE_BY_DEFAULT);
+            else
+                targets.erase(existing);
+            continue;
+        }
+
         std::map<Unit*, uint8>::iterator existing = targets.find(appIter->second->GetTarget());
         // not found in current area - remove the aura
         if (existing == targets.end())
@@ -690,6 +779,13 @@ void Aura::UpdateTargetMap(Unit* caster, bool apply)
                 // ok, we have one unit twice in target map (impossible, but...)
                 ABORT();
             }
+        }
+
+        // never create an application on a unit the running map task may not write
+        if (!CanWriteTargetNow(itr->first))
+        {
+            targets.erase(itr++);
+            continue;
         }
 
         bool addUnit = true;
@@ -803,10 +899,13 @@ void Aura::_ApplyEffectForTargets(uint8 effIndex)
 {
     // prepare list of aura targets
     UnitList targetList;
-    for (ApplicationMap::iterator appIter = m_applications.begin(); appIter != m_applications.end(); ++appIter)
     {
-        if ((appIter->second->GetEffectsToApply() & (1 << effIndex)) && !appIter->second->HasEffect(effIndex))
-            targetList.push_back(appIter->second->GetTarget());
+        std::lock_guard<Acore::SpinLock> guard(m_applicationsLock);
+        for (ApplicationMap::iterator appIter = m_applications.begin(); appIter != m_applications.end(); ++appIter)
+        {
+            if ((appIter->second->GetEffectsToApply() & (1 << effIndex)) && !appIter->second->HasEffect(effIndex))
+                targetList.push_back(appIter->second->GetTarget());
+        }
     }
 
     // apply effect to targets
@@ -1141,7 +1240,8 @@ bool Aura::ModStackAmount(int32 num, AuraRemoveMode removeMode, bool periodicRes
 
 void Aura::RefreshSpellMods()
 {
-    for (Aura::ApplicationMap::const_iterator appIter = m_applications.begin(); appIter != m_applications.end(); ++appIter)
+    ApplicationMap applications = GetApplicationMap();
+    for (Aura::ApplicationMap::const_iterator appIter = applications.begin(); appIter != applications.end(); ++appIter)
         if (Player* player = appIter->second->GetTarget()->ToPlayer())
             player->RestoreAllSpellMods(0, this);
 }
@@ -1183,8 +1283,17 @@ bool Aura::IsStaticOnOwner() const
 {
     // Permanent and not channeled: a static aura can neither expire nor lose its channeling caster,
     // so Unit::_UpdateSpells only checks the auras on its update list for either
-    if (m_duration >= 0 || m_spellInfo->IsChanneled() || GetType() != UNIT_AURA_TYPE || m_applications.size() != 1 || !m_removedApplications.empty())
+    if (m_duration >= 0 || m_spellInfo->IsChanneled() || GetType() != UNIT_AURA_TYPE)
         return false;
+
+    AuraApplication const* ownerApp = nullptr;
+    {
+        std::lock_guard<Acore::SpinLock> guard(m_applicationsLock);
+        if (m_applications.size() != 1 || !m_removedApplications.empty())
+            return false;
+
+        ownerApp = m_applications.begin()->second;
+    }
 
     for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
         if (m_effects[i] && m_effects[i]->IsPeriodic())
@@ -1194,7 +1303,6 @@ bool Aura::IsStaticOnOwner() const
         if (!script->DoCheckAreaTarget.empty())
             return false;
 
-    AuraApplication const* ownerApp = m_applications.begin()->second;
     return ownerApp->GetTarget() == GetOwner() && ownerApp->GetEffectMask() == GetEffectMask() && IsOwnerOnlyUnitAura();
 }
 
@@ -1386,6 +1494,7 @@ void Aura::HandleAllEffects(AuraApplication* aurApp, uint8 mode, bool apply)
 
 void Aura::GetApplicationList(std::list<AuraApplication*>& applicationList) const
 {
+    std::lock_guard<Acore::SpinLock> guard(m_applicationsLock);
     for (Aura::ApplicationMap::const_iterator appIter = m_applications.begin(); appIter != m_applications.end(); ++appIter)
     {
         if (appIter->second->GetEffectMask())
@@ -1393,9 +1502,27 @@ void Aura::GetApplicationList(std::list<AuraApplication*>& applicationList) cons
     }
 }
 
+void Aura::GetApplicationListForEffect(uint8 effIndex, std::list<AuraApplication*>& applicationList) const
+{
+    std::lock_guard<Acore::SpinLock> guard(m_applicationsLock);
+    for (ApplicationMap::value_type const& app : m_applications)
+        if (app.second->HasEffect(effIndex))
+            applicationList.push_back(app.second);
+}
+
+void Aura::GetTargetListForEffect(uint8 effIndex, std::list<Unit*>& targetList) const
+{
+    std::lock_guard<Acore::SpinLock> guard(m_applicationsLock);
+    for (ApplicationMap::value_type const& app : m_applications)
+        if (app.second->HasEffect(effIndex))
+            targetList.push_back(app.second->GetTarget());
+}
+
 void Aura::SetNeedClientUpdateForTargets() const
 {
-    for (ApplicationMap::const_iterator appIter = m_applications.begin(); appIter != m_applications.end(); ++appIter)
+    // SetNeedClientUpdate flags the target unit: do it outside the lock
+    ApplicationMap applications = GetApplicationMap();
+    for (ApplicationMap::const_iterator appIter = applications.begin(); appIter != applications.end(); ++appIter)
         appIter->second->SetNeedClientUpdate();
 }
 
@@ -2535,11 +2662,14 @@ void Aura::ConsumeProcCharges(SpellProcEntry const* procEntry)
 
 void Aura::_DeleteRemovedApplications()
 {
-    while (!m_removedApplications.empty())
+    Unit::AuraApplicationList removed;
     {
-        delete m_removedApplications.front();
-        m_removedApplications.pop_front();
+        std::lock_guard<Acore::SpinLock> guard(m_applicationsLock);
+        removed.swap(m_removedApplications);
     }
+
+    for (AuraApplication* aurApp : removed)
+        delete aurApp;
 
     InvalidateStaticOnOwner();
 }

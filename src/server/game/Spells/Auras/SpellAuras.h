@@ -19,6 +19,7 @@
 #define ACORE_SPELLAURAS_H
 
 #include "SpellAuraDefines.h"
+#include "SpinLock.h"
 #include "Unit.h"
 
 class Unit;
@@ -185,11 +186,21 @@ public:
     void HandleAllEffects(AuraApplication* aurApp, uint8 mode, bool apply);
 
     // Helpers for targets
-    ApplicationMap const& GetApplicationMap() {return m_applications;}
+    // m_applications is written by the owner's task and, through Unit::_UnapplyAura, by the
+    // task of every application target (which may be far from the owner on a map updated by
+    // several threads), so every access takes m_applicationsLock. The accessors below copy or
+    // look up under the lock; never call into a target while holding it.
+    ApplicationMap GetApplicationMap() const { std::lock_guard<Acore::SpinLock> guard(m_applicationsLock); return m_applications; }
     void GetApplicationList(std::list<AuraApplication*>& applicationList) const;
-    AuraApplication const* GetApplicationOfTarget (ObjectGuid guid) const { ApplicationMap::const_iterator itr = m_applications.find(guid); if (itr != m_applications.end()) return itr->second; return nullptr; }
-    AuraApplication* GetApplicationOfTarget (ObjectGuid guid) { ApplicationMap::iterator itr = m_applications.find(guid); if (itr != m_applications.end()) return itr->second; return nullptr; }
-    bool IsAppliedOnTarget(ObjectGuid guid) const { return m_applications.find(guid) != m_applications.end(); }
+    // applications having effect effIndex (AuraEffect::GetApplicationList / GetTargetList)
+    void GetApplicationListForEffect(uint8 effIndex, std::list<AuraApplication*>& applicationList) const;
+    void GetTargetListForEffect(uint8 effIndex, std::list<Unit*>& targetList) const;
+    AuraApplication const* GetApplicationOfTarget (ObjectGuid guid) const { std::lock_guard<Acore::SpinLock> guard(m_applicationsLock); ApplicationMap::const_iterator itr = m_applications.find(guid); if (itr != m_applications.end()) return itr->second; return nullptr; }
+    AuraApplication* GetApplicationOfTarget (ObjectGuid guid) { std::lock_guard<Acore::SpinLock> guard(m_applicationsLock); ApplicationMap::iterator itr = m_applications.find(guid); if (itr != m_applications.end()) return itr->second; return nullptr; }
+    bool IsAppliedOnTarget(ObjectGuid guid) const { std::lock_guard<Acore::SpinLock> guard(m_applicationsLock); return m_applications.find(guid) != m_applications.end(); }
+    // an unapply of an application whose target the running map task may not write was queued
+    // to the phase's serial step; the aura must not be deleted before it ran (Unit::_DeleteRemovedAuras)
+    bool HasPendingRemoteUnapply() const { return m_pendingRemoteUnapplies != 0; }
 
     void SetNeedClientUpdateForTargets() const;
     void HandleAuraSpecificMods(AuraApplication const* aurApp, Unit* caster, bool apply, bool onReapply);
@@ -278,7 +289,14 @@ protected:
     int8 m_staticOnOwner = -1;                          // cached IsStaticOnOwner(): -1 unknown, 0 no, 1 yes
 
     AuraEffect* m_effects[3];
-    ApplicationMap m_applications;
+    ApplicationMap m_applications;                      // guarded by m_applicationsLock
+    mutable Acore::SpinLock m_applicationsLock;         // m_applications and m_removedApplications
+    uint32 m_pendingRemoteUnapplies = 0;                // queued QueueRemoteUnapply ops not run yet (owner task / serial step only)
+
+    // whether the running map task may write target now (always true outside a parallel phase)
+    bool CanWriteTargetNow(Unit const* target) const;
+    // unapplies aurApp from its target, which the running task may not write, in the serial step after the phase
+    void QueueRemoteUnapply(AuraApplication* aurApp, AuraRemoveMode removeMode);
 
     bool m_isRemoved: 1;
     bool m_isSingleTarget: 1;                       // true if it's a single target spell and registered at caster - can change at spell steal for example
@@ -287,7 +305,7 @@ protected:
     TimePoint m_procCooldown;
 
 private:
-    Unit::AuraApplicationList m_removedApplications;
+    Unit::AuraApplicationList m_removedApplications;    // guarded by m_applicationsLock
 
     SpellInfo const* m_triggeredByAuraSpellInfo;
 };
