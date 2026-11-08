@@ -20,13 +20,13 @@
 
 void AbstractFollower::SetTarget(Unit* unit)
 {
-    if (unit == _target)
+    Unit* old = _target.load(std::memory_order_relaxed);
+    if (unit == old)
         return;
 
-    if (_target)
-        _target->FollowerRemoved(this);
+    if (old)
+        old->FollowerRemoved(this);
 
-    _target = unit;
-    if (_target)
-        _target->FollowerAdded(this);
+    // a unit leaving the world refuses followers (its RemoveAllFollowers may already have run): follow nothing then
+    _target.store(unit && unit->FollowerAdded(this) ? unit : nullptr, std::memory_order_relaxed);
 }

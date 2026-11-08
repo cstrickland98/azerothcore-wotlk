@@ -1936,9 +1936,19 @@ public:
     void Dismount();
     [[nodiscard]] bool IsInDisallowedMountForm() const;
 
-    // Followers
-    void FollowerAdded(AbstractFollower* f) { m_followingMe.insert(f); }
-    void FollowerRemoved(AbstractFollower* f) { m_followingMe.erase(f); }
+    // Followers (AbstractFollower): a follower's SetTarget runs on the follower's map task, which with intra-map
+    // threading may not be ours, so the set is locked. FollowerAdded returns false while this unit leaves the world
+    // (RemoveAllFollowers may already have run); the follower then follows nothing.
+    bool FollowerAdded(AbstractFollower* f)
+    {
+        std::lock_guard<Acore::SpinLock> guard(_followersLock);
+        if (m_duringRemoveFromWorld || !IsInWorld())
+            return false;
+
+        m_followingMe.insert(f);
+        return true;
+    }
+    void FollowerRemoved(AbstractFollower* f) { std::lock_guard<Acore::SpinLock> guard(_followersLock); m_followingMe.erase(f); }
     [[nodiscard]] virtual float GetFollowAngle() const { return static_cast<float>(M_PI / 2); }
     void RemoveAllFollowers();
 
@@ -2298,7 +2308,8 @@ private:
 
     Diminishing m_Diminishing;
 
-    std::unordered_set<AbstractFollower*> m_followingMe;
+    std::unordered_set<AbstractFollower*> m_followingMe;    // guarded by _followersLock
+    mutable Acore::SpinLock _followersLock;
 
     Unit* m_comboTarget;
     int8 m_comboPoints;
