@@ -130,6 +130,20 @@ void Totem::InitSummon()
 
 void Totem::UnSummon(Milliseconds msTime)
 {
+    // Called from the owner's update (RemoveAllControlled on teleport or death, totem replacement) this totem can
+    // be far, in another task's area of a parallel map phase: it is written here, so unsummon on its owner.
+    if (Map* map = FindMap(); map && map->IsParallelPhase() && !map->CanWriteNow(this))
+    {
+        map->RunOnOwner(this, [msTime](WorldObject* target)
+        {
+            if (Creature* creature = target->ToCreature())
+                if (creature->IsInWorld())
+                    if (TempSummon* summon = creature->ToTempSummon())
+                        summon->UnSummon(msTime);
+        });
+        return;
+    }
+
     if (msTime > 0ms)
     {
         m_Events.AddEventAtOffset(new ForcedUnsummonDelayEvent(*this), msTime);
