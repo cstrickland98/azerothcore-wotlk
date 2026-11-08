@@ -158,13 +158,17 @@ bool OPvPCapturePoint::DelCreature(uint32 type)
         return false;
     }
 
-    auto bounds = _pvp->GetMap()->GetCreatureBySpawnIdStore().equal_range(spawnId);
-    for (auto itr = bounds.first; itr != bounds.second;)
+    std::vector<Creature*> creatures;
     {
-        // can happen when closing the core
-        Creature* c = itr->second;
-        ++itr;
+        Map* map = _pvp->GetMap();
+        auto storeGuard = map->LockObjectsStoreForRead();
+        auto const bounds = map->GetCreatureBySpawnIdStore().equal_range(spawnId);
+        for (auto itr = bounds.first; itr != bounds.second; ++itr)
+            creatures.push_back(itr->second);
+    }
 
+    for (Creature* c : creatures)
+    {
         // Don't save respawn time
         c->SetRespawnTime(0);
         c->RemoveCorpse();
@@ -197,11 +201,17 @@ bool OPvPCapturePoint::DelObject(uint32 type)
     if (!spawnId)
         return false;
 
-    auto bounds = _pvp->GetMap()->GetGameObjectBySpawnIdStore().equal_range(spawnId);
-    for (auto itr = bounds.first; itr != bounds.second;)
+    std::vector<GameObject*> gameObjects;
     {
-        GameObject* go = itr->second;
-        ++itr;
+        Map* map = _pvp->GetMap();
+        auto storeGuard = map->LockObjectsStoreForRead();
+        auto const bounds = map->GetGameObjectBySpawnIdStore().equal_range(spawnId);
+        for (auto itr = bounds.first; itr != bounds.second; ++itr)
+            gameObjects.push_back(itr->second);
+    }
+
+    for (GameObject* go : gameObjects)
+    {
         // Don't save respawn time
         go->SetRespawnTime(0);
         go->Delete();

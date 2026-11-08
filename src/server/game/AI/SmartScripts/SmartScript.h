@@ -141,7 +141,9 @@ public:
 
     GameObject* FindGameObjectNear(WorldObject* searchObject, ObjectGuid::LowType guid) const
     {
-        auto bounds = searchObject->GetMap()->GetGameObjectBySpawnIdStore().equal_range(guid);
+        Map* map = searchObject->GetMap();
+        auto storeGuard = map->LockObjectsStoreForRead();
+        auto const bounds = map->GetGameObjectBySpawnIdStore().equal_range(guid);
         if (bounds.first == bounds.second)
             return nullptr;
 
@@ -150,16 +152,24 @@ public:
 
     Creature* FindCreatureNear(WorldObject* searchObject, ObjectGuid::LowType guid) const
     {
-        auto bounds = searchObject->GetMap()->GetCreatureBySpawnIdStore().equal_range(guid);
-        if (bounds.first == bounds.second)
+        Map* map = searchObject->GetMap();
+        std::vector<Creature*> creatures;
+        {
+            auto storeGuard = map->LockObjectsStoreForRead();
+            auto const bounds = map->GetCreatureBySpawnIdStore().equal_range(guid);
+            for (auto itr = bounds.first; itr != bounds.second; ++itr)
+                creatures.push_back(itr->second);
+        }
+
+        if (creatures.empty())
             return nullptr;
 
-        auto creatureItr = std::find_if(bounds.first, bounds.second, [](Map::CreatureBySpawnIdContainer::value_type const& pair)
+        auto const creatureItr = std::find_if(creatures.begin(), creatures.end(), [](Creature const* creature)
         {
-            return pair.second->IsAlive();
+            return creature->IsAlive();
         });
 
-        return creatureItr != bounds.second ? creatureItr->second : bounds.first->second;
+        return creatureItr != creatures.end() ? *creatureItr : creatures.front();
     }
 
     void OnReset();
