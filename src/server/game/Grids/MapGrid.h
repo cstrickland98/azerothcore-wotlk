@@ -21,10 +21,14 @@
 #include "GridCell.h"
 #include "GridReference.h"
 #include "MapThreading.h"
+#include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <type_traits>
+#include <utility>
+#include <vector>
 
 class GridTerrainData;
 
@@ -40,6 +44,16 @@ public:
 
     MapGrid(uint16 const x, uint16 const y)
         : _x(x), _y(y), _objectDataLoaded(false), _terrainData(nullptr) { }
+
+    ~MapGrid()
+    {
+        for (auto& cellX : _cells)
+            for (auto& cellY : cellX)
+                delete cellY.load(std::memory_order_relaxed);
+    }
+
+    MapGrid(MapGrid const&) = delete;
+    MapGrid& operator=(MapGrid const&) = delete;
 
     // Unique identifier for grid
     uint32 GetId() const { return _y * MAX_NUMBER_OF_GRIDS + _x; }
@@ -62,16 +76,12 @@ public:
 
     template<class SPECIFIC_OBJECT> void AddFarVisibleObject(uint16 const x, uint16 const y, SPECIFIC_OBJECT* obj)
     {
-        GridCellType& cell = GetOrCreateCell(x, y);
-        std::unique_lock<std::shared_mutex> guard = LockFarVisibleForWrite();
-        cell.AddFarVisibleObject(obj);
+        ChangeFarVisible([this, x, y, obj]() { GetOrCreateCell(x, y).AddFarVisibleObject(obj); });
     }
 
     template<class SPECIFIC_OBJECT> void RemoveFarVisibleObject(uint16 const x, uint16 const y, SPECIFIC_OBJECT* obj)
     {
-        GridCellType& cell = GetOrCreateCell(x, y);
-        std::unique_lock<std::shared_mutex> guard = LockFarVisibleForWrite();
-        cell.RemoveFarVisibleObject(obj);
+        ChangeFarVisible([this, x, y, obj]() { GetOrCreateCell(x, y).RemoveFarVisibleObject(obj); });
     }
 
     // Visit all cells
@@ -82,10 +92,11 @@ public:
         {
             for (auto& cellY : cellX)
             {
-                if (!cellY)
+                GridCellType* gridCell = cellY.load(std::memory_order_acquire);
+                if (!gridCell)
                     continue;
 
-                cellY->Visit(visitor);
+                gridCell->Visit(visitor);
             }
         }
     }
@@ -94,31 +105,31 @@ public:
     template<class T, class TT>
     void VisitCell(uint16 const x, uint16 const y, TypeContainerVisitor<T, TT>& visitor)
     {
-        if (!MapThreading::InParallelPhase())
-        {
-            if (GridCellType* gridCell = GetCell(x, y))
-                gridCell->Visit(visitor);
-
-            return;
-        }
-
-        // In a parallel phase cells of this grid can be created, and its far visible lists changed, by the task of
-        // another grid: the far visible lists are read under the lock, the other lists are owned by this thread
-        std::shared_lock<std::shared_mutex> guard(_cellLock);
         GridCellType* gridCell = GetCell(x, y);
         if (!gridCell)
             return;
 
+        // In a parallel phase the far visible lists of this grid can be changed by the task of another grid: they
+        // are read under the lock. The other lists are owned by this thread.
         if constexpr (std::is_same_v<TT, TypeVectorContainer<FAR_VISIBLE_OBJECT_TYPES>>)
         {
-            FarVisibleReadScope const readScope(&_cellLock);
-            gridCell->Visit(visitor);
+            if (MapThreading::InParallelPhase())
+            {
+                FarVisibleReadState& state = GetFarVisibleReadState();
+                {
+                    std::shared_lock<std::shared_mutex> guard(_cellLock);
+                    FarVisibleReadScope const readScope(state);
+                    gridCell->Visit(visitor);
+                }
+
+                if (!state.depth)
+                    ApplyPendingFarVisibleChanges(state);
+
+                return;
+            }
         }
-        else
-        {
-            guard.unlock();
-            gridCell->Visit(visitor);
-        }
+
+        gridCell->Visit(visitor);
     }
 
     void link(GridRefMgr<MapGrid<GRID_OBJECT_TYPES, FAR_VISIBLE_OBJECT_TYPES>>* pTo)
@@ -137,7 +148,7 @@ public:
         {
             for (auto& cellY : cellX)
             {
-                if (!cellY)
+                if (!cellY.load(std::memory_order_acquire))
                     continue;
 
                 ++count;
@@ -147,77 +158,107 @@ public:
     }
 
 private:
-    // Marks the far visible lock this thread reads under, so that a visitor changing a far visible list of the
-    // same grid does not wait for itself
-    struct FarVisibleReadScope
+    // Far visible list changes made while this thread reads far visible lists (of any grid) under a shared lock.
+    // Writing under the shared lock would race the other readers, and waiting for a unique lock while holding a
+    // shared one can deadlock, so they are applied once the outermost read ends.
+    struct FarVisibleReadState
     {
-        explicit FarVisibleReadScope(std::shared_mutex const* lock) : _previous(HeldFarVisibleLock())
-        {
-            HeldFarVisibleLock() = lock;
-        }
-
-        ~FarVisibleReadScope() { HeldFarVisibleLock() = _previous; }
-
-        std::shared_mutex const* _previous;
+        uint32 depth = 0;
+        std::vector<std::function<void()>> pending;
     };
 
-    static std::shared_mutex const*& HeldFarVisibleLock()
+    struct FarVisibleReadScope
     {
-        thread_local std::shared_mutex const* held = nullptr;
-        return held;
+        explicit FarVisibleReadScope(FarVisibleReadState& state) : _state(state) { ++_state.depth; }
+        ~FarVisibleReadScope() { --_state.depth; }
+
+        FarVisibleReadScope(FarVisibleReadScope const&) = delete;
+        FarVisibleReadScope& operator=(FarVisibleReadScope const&) = delete;
+
+        FarVisibleReadState& _state;
+    };
+
+    static FarVisibleReadState& GetFarVisibleReadState()
+    {
+        thread_local FarVisibleReadState state;
+        return state;
     }
 
-    std::unique_lock<std::shared_mutex> LockFarVisibleForWrite()
+    static void ApplyPendingFarVisibleChanges(FarVisibleReadState& state)
     {
-        std::unique_lock<std::shared_mutex> guard(_cellLock, std::defer_lock);
-        if (MapThreading::InParallelPhase() && HeldFarVisibleLock() != &_cellLock)
-            guard.lock();
+        if (state.pending.empty())
+            return;
 
-        return guard;
+        std::vector<std::function<void()>> pending;
+        pending.swap(state.pending);
+        for (std::function<void()>& change : pending)
+            change();
+
+        // Keep the capacity for the next read
+        pending.clear();
+        if (state.pending.empty())
+            state.pending.swap(pending);
     }
 
-    // Creates and returns the cell if not already created
-    GridCellType& GetOrCreateCell(uint16 const x, uint16 const y)
+    template<class CHANGE>
+    void ChangeFarVisible(CHANGE&& change)
     {
-        if (!MapThreading::InParallelPhase() || HeldFarVisibleLock() == &_cellLock)
+        if (!MapThreading::InParallelPhase())
         {
-            if (!_cells[x][y])
-                _cells[x][y] = std::make_unique<GridCellType>();
-
-            return *_cells[x][y];
+            change();
+            return;
         }
 
+        FarVisibleReadState& state = GetFarVisibleReadState();
+        if (state.depth)
         {
-            std::shared_lock<std::shared_mutex> guard(_cellLock);
-            if (GridCellType* cell = GetCell(x, y))
-                return *cell;
+            state.pending.emplace_back([this, change = std::forward<CHANGE>(change)]() mutable
+            {
+                std::unique_lock<std::shared_mutex> guard(_cellLock);
+                change();
+            });
+
+            return;
         }
 
         std::unique_lock<std::shared_mutex> guard(_cellLock);
-        if (!_cells[x][y])
-            _cells[x][y] = std::make_unique<GridCellType>();
+        change();
+    }
 
-        return *_cells[x][y];
+    // Creates and returns the cell if not already created. In a parallel phase the tasks of two grids can create
+    // cells of a third one at once: the first cell published wins, without a lock.
+    GridCellType& GetOrCreateCell(uint16 const x, uint16 const y)
+    {
+        if (GridCellType* cell = GetCell(x, y))
+            return *cell;
+
+        GridCellType* created = new GridCellType();
+        GridCellType* expected = nullptr;
+        if (_cells[x][y].compare_exchange_strong(expected, created, std::memory_order_acq_rel, std::memory_order_acquire))
+            return *created;
+
+        delete created;
+        return *expected;
     }
 
     GridCellType* GetCell(uint16 const x, uint16 const y)
     {
         ASSERT(x < MAX_NUMBER_OF_CELLS && y < MAX_NUMBER_OF_CELLS);
-        return _cells[x][y].get();
+        return _cells[x][y].load(std::memory_order_acquire);
     }
 
     GridCellType const* GetCell(uint16 const x, uint16 const y) const
     {
         ASSERT(x < MAX_NUMBER_OF_CELLS && y < MAX_NUMBER_OF_CELLS);
-        return _cells[x][y].get();
+        return _cells[x][y].load(std::memory_order_acquire);
     }
 
     uint16 _x;
     uint16 _y;
 
     bool _objectDataLoaded;
-    mutable std::shared_mutex _cellLock;
-    std::array<std::array<std::unique_ptr<GridCellType>, MAX_NUMBER_OF_CELLS>, MAX_NUMBER_OF_CELLS> _cells; // N * N array
+    mutable std::shared_mutex _cellLock;    // far visible lists, in a parallel phase
+    std::array<std::array<std::atomic<GridCellType*>, MAX_NUMBER_OF_CELLS>, MAX_NUMBER_OF_CELLS> _cells{}; // N * N array, owned
     GridReference<MapGrid<GRID_OBJECT_TYPES, FAR_VISIBLE_OBJECT_TYPES>> _gridReference;
 
     // Instances will share a copy of the parent maps terrainData
