@@ -841,7 +841,7 @@ class spell_dk_pet_scaling : public AuraScript
 
             // xinef: Update appropriate player field
             if (owner->IsPlayer())
-                owner->SetUInt32Value(PLAYER_PET_SPELL_POWER, (uint32)amount);
+                owner->ToPlayer()->SetPetSpellPower((uint32)amount);
         }
     }
 

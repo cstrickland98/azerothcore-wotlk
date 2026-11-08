@@ -9183,6 +9183,23 @@ void Player::ResetPetTalents()
     SendTalentsInfoData(true);
 }
 
+void Player::SetPetSpellPower(uint32 amount)
+{
+    // Pet scaling auras recalculate on the pet's update, and the pet can be far from its master, in another
+    // task's area: the field is then written on the master's owner (inline when writable)
+    Map* map = FindMap();
+    if (!map)
+    {
+        SetUInt32Value(PLAYER_PET_SPELL_POWER, amount);
+        return;
+    }
+
+    map->RunOnOwner(this, [amount](WorldObject* target)
+    {
+        target->SetUInt32Value(PLAYER_PET_SPELL_POWER, amount);
+    });
+}
+
 Pet* Player::GetPet() const
 {
     if (ObjectGuid pet_guid = GetPetGUID())

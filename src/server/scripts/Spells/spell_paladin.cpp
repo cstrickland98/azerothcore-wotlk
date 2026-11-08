@@ -570,9 +570,12 @@ class spell_pal_blessing_of_sanctuary : public AuraScript
 
     void HandleEffectApply(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/)
     {
+        // The buff is applied here on the target's behalf (e.g. when a pet's saved auras are loaded), and the
+        // paladin can be anywhere: the target casts it on itself in the paladin's name, so the paladin, possibly
+        // updated by another task, is not written
         Unit* target = GetTarget();
-        if (Unit* caster = GetCaster())
-            caster->CastSpell(target, SPELL_PALADIN_BLESSING_OF_SANCTUARY_BUFF, true);
+        if (GetCaster())
+            target->CastSpell(target, SPELL_PALADIN_BLESSING_OF_SANCTUARY_BUFF, true, nullptr, nullptr, GetCasterGUID());
     }
 
     void HandleEffectRemove(AuraEffect const* /*aurEff*/, AuraEffectHandleModes /*mode*/)

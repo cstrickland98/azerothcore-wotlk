@@ -370,7 +370,7 @@ class spell_warl_generic_scaling : public AuraScript
 
             // Update appropriate player field
             if (owner->IsPlayer())
-                owner->SetUInt32Value(PLAYER_PET_SPELL_POWER, (uint32)amount);
+                owner->ToPlayer()->SetPetSpellPower((uint32)amount);
         }
     }
 
@@ -481,7 +481,7 @@ class spell_warl_infernal_scaling : public AuraScript
 
             // xinef: Update appropriate player field
             if (owner->IsPlayer())
-                owner->SetUInt32Value(PLAYER_PET_SPELL_POWER, (uint32)amount);
+                owner->ToPlayer()->SetPetSpellPower((uint32)amount);
         }
     }
 
