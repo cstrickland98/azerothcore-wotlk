@@ -23,6 +23,7 @@
 #include "MapDefines.h"
 #include "MapGrid.h"
 
+#include <atomic>
 #include <mutex>
 
 class Map;
@@ -57,6 +58,8 @@ private:
 
     std::mutex _gridLock;
     std::unique_ptr<MapGridType> _mapGrid[MAX_NUMBER_OF_GRIDS][MAX_NUMBER_OF_GRIDS];
+    // Published copy of _mapGrid: grids are created under _gridLock while map workers look them up without it
+    std::atomic<MapGridType*> _gridPtr[MAX_NUMBER_OF_GRIDS][MAX_NUMBER_OF_GRIDS];
 };
 
 #endif

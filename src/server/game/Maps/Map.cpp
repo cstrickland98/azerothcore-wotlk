@@ -30,6 +30,7 @@
 #include "LFGMgr.h"
 #include "MapGrid.h"
 #include "MapInstanced.h"
+#include "MapWorkerPool.h"
 #include "Metric.h"
 #include "MiscPackets.h"
 #include "Object.h"
@@ -45,6 +46,10 @@
 #include "VMapMgr2.h"
 #include "Weather.h"
 #include "WeatherMgr.h"
+#include <algorithm>
+#include <chrono>
+#include <iterator>
+#include <type_traits>
 
 #define MAP_INVALID_ZONE        0xFFFFFFFF
 
@@ -54,6 +59,8 @@ ZoneDynamicInfo::ZoneDynamicInfo() : MusicId(0), DefaultWeather(nullptr), Weathe
 Map::~Map()
 {
     // UnloadAll must be called before deleting the map
+
+    _workerPool.reset();
 
     // Kill all scheduled events without executing them, since the map and its objects are being destroyed.
     // This prevents events from running on invalid or deleted objects during map destruction.
@@ -83,6 +90,15 @@ Map::Map(uint32 id, uint32 InstanceId, uint8 SpawnMode, Map* _parent) :
     _corpseUpdateTimer.SetInterval(20 * MINUTE * IN_MILLISECONDS);
 
     _poolData = sPoolMgr->InitPoolsForMap(this);
+
+    // Created up front so that generating a GUID never inserts into _guidGenerators from a map worker
+    GetGuidSequenceGenerator<HighGuid::Transport>();
+    GetGuidSequenceGenerator<HighGuid::Unit>();
+    GetGuidSequenceGenerator<HighGuid::Vehicle>();
+    GetGuidSequenceGenerator<HighGuid::Pet>();
+    GetGuidSequenceGenerator<HighGuid::GameObject>();
+    GetGuidSequenceGenerator<HighGuid::DynamicObject>();
+    GetGuidSequenceGenerator<HighGuid::Corpse>();
 }
 
 // Hook called after map is created AND after added to map list
@@ -187,7 +203,17 @@ void Map::EnsureGridCreated(GridCoord const& gridCoord)
 
 bool Map::EnsureGridLoaded(Cell const& cell)
 {
-    EnsureGridCreated(GridCoord(cell.GridX(), cell.GridY()));
+    GridCoord const gridCoord(cell.GridX(), cell.GridY());
+    EnsureGridCreated(gridCoord);
+
+    // In a parallel phase the grid's objects are loaded at the phase boundary, see FinishPhase
+    if (MapWorkerScratch* scratch = GetPhaseScratch())
+    {
+        if (!IsGridLoaded(gridCoord))
+            scratch->gridLoads.push_back(gridCoord);
+
+        return false;
+    }
 
     if (_mapGridManager.LoadGrid(cell.GridX(), cell.GridY()))
     {
@@ -422,6 +448,8 @@ void Map::UpdatePlayerZoneStats(uint32 oldZone, uint32 newZone)
     if (oldZone == newZone)
         return;
 
+    std::lock_guard<std::mutex> guard(_zonePlayerCountLock);
+
     if (oldZone != MAP_INVALID_ZONE)
     {
         uint32& oldZoneCount = _zonePlayerCountMap[oldZone];
@@ -435,6 +463,12 @@ void Map::UpdatePlayerZoneStats(uint32 oldZone, uint32 newZone)
 
 void Map::Update(const uint32 t_diff, const uint32 s_diff, bool  /*thread*/)
 {
+    if (_threadsPerMap > 1)
+    {
+        UpdateParallel(t_diff, s_diff);
+        return;
+    }
+
     if (t_diff)
         _mapCollisionData.GetDynamicTree().update(t_diff);
 
@@ -580,13 +614,571 @@ void Map::UpdateNonPlayerObjects(uint32 const diff)
     }
 }
 
+void Map::SetThreadsPerMap(uint32 threads)
+{
+    ASSERT(!_workerPool);
+    _threadsPerMap = std::max<uint32>(threads, 1);
+    _mapCollisionData.SetWorkerCount(_threadsPerMap);
+}
+
+bool Map::GetObjectGridCoord(WorldObject const* obj, int32& gridX, int32& gridY)
+{
+    if (!obj)
+        return false;
+
+    Cell const* currentCell = nullptr;
+    if (Creature const* creature = obj->ToCreature())
+    {
+        if (creature->IsInGrid())
+            currentCell = &creature->GetCurrentCell();
+    }
+    else if (GameObject const* go = obj->ToGameObject())
+    {
+        if (go->IsInGrid())
+            currentCell = &go->GetCurrentCell();
+    }
+    else if (DynamicObject const* dynObj = obj->ToDynObject())
+    {
+        if (dynObj->IsInGrid())
+            currentCell = &dynObj->GetCurrentCell();
+    }
+
+    if (currentCell)
+    {
+        gridX = int32(currentCell->GridX());
+        gridY = int32(currentCell->GridY());
+        return true;
+    }
+
+    GridCoord const gridCoord = Acore::ComputeGridCoord(obj->GetPositionX(), obj->GetPositionY());
+    if (!gridCoord.IsCoordValid())
+        return false;
+
+    gridX = int32(gridCoord.x_coord);
+    gridY = int32(gridCoord.y_coord);
+    return true;
+}
+
+void Map::RunOnOwner(WorldObject* target, std::function<void(WorldObject*)> fn)
+{
+    if (!target || !fn)
+        return;
+
+    MapWorkerScratch* scratch = GetPhaseScratch();
+    if (!scratch || MapThreading::IsWritable(target))
+    {
+        fn(target);
+        return;
+    }
+
+    scratch->deferred.push_back({ target->GetGUID(), std::move(fn) });
+}
+
+void Map::RunOnOwner(ObjectGuid target, std::function<void(WorldObject*)> fn)
+{
+    if (target.IsEmpty() || !fn)
+        return;
+
+    MapWorkerScratch* scratch = GetPhaseScratch();
+    WorldObject* obj = FindObjectForDeferredOp(target);
+    if (!scratch || (obj && MapThreading::IsWritable(obj)))
+    {
+        if (obj)
+            fn(obj);
+
+        return;
+    }
+
+    scratch->deferred.push_back({ target, std::move(fn) });
+}
+
+void Map::DeferToPhaseEnd(std::function<void()> fn)
+{
+    if (MapWorkerScratch* scratch = GetPhaseScratch())
+        scratch->deferred.push_back({ ObjectGuid::Empty, [fn = std::move(fn)](WorldObject*) { fn(); } });
+    else
+        fn();
+}
+
+WorldObject* Map::FindObjectForDeferredOp(ObjectGuid const& guid)
+{
+    switch (guid.GetHigh())
+    {
+        case HighGuid::Player:
+            return ObjectAccessor::GetPlayer(this, guid);
+        case HighGuid::Unit:
+        case HighGuid::Vehicle:
+            return GetCreature(guid);
+        case HighGuid::Pet:
+            return GetPet(guid);
+        case HighGuid::GameObject:
+        case HighGuid::Transport:
+        case HighGuid::Mo_Transport:
+            return GetGameObject(guid);
+        case HighGuid::DynamicObject:
+            return GetDynamicObject(guid);
+        case HighGuid::Corpse:
+            return GetCorpse(guid);
+        default:
+            return nullptr;
+    }
+}
+
+Map::MapGridTask* Map::GetOrCreateGridTask(int32 gridX, int32 gridY)
+{
+    if (gridX < 0 || gridY < 0 || gridX >= MAX_NUMBER_OF_GRIDS || gridY >= MAX_NUMBER_OF_GRIDS)
+        return nullptr;
+
+    int32& index = _gridTaskIndex[gridY * MAX_NUMBER_OF_GRIDS + gridX];
+    if (index < 0)
+    {
+        if (_gridTaskCount == _gridTasks.size())
+            _gridTasks.emplace_back();
+
+        MapGridTask& task = _gridTasks[_gridTaskCount];
+        task.x = uint16(gridX);
+        task.y = uint16(gridY);
+        task.weight = 0;
+
+        index = int32(_gridTaskCount);
+        _phaseTasks[(gridX & 1) | ((gridY & 1) << 1)].push_back(_gridTaskCount);
+        ++_gridTaskCount;
+    }
+
+    return &_gridTasks[index];
+}
+
+void Map::BuildGridTasks(bool fullTick)
+{
+    for (uint32 i = 0; i < _gridTaskCount; ++i)
+    {
+        MapGridTask& task = _gridTasks[i];
+        _gridTaskIndex[task.y * MAX_NUMBER_OF_GRIDS + task.x] = -1;
+        task.players.clear();
+        task.objects.clear();
+        task.delayedVisibility.clear();
+    }
+
+    _gridTaskCount = 0;
+    for (std::vector<uint32>& phaseTasks : _phaseTasks)
+        phaseTasks.clear();
+
+    _serialPlayers.clear();
+    _serialUpdatables.clear();
+    _serialDelayedVisibility.clear();
+
+    int32 gridX = 0;
+    int32 gridY = 0;
+
+    for (MapReference const& ref : m_mapRefMgr)
+    {
+        Player* player = ref.GetSource();
+        if (!player || !player->IsInWorld())
+            continue;
+
+        if (MapGridTask* task = GetObjectGridCoord(player, gridX, gridY) ? GetOrCreateGridTask(gridX, gridY) : nullptr)
+        {
+            task->players.push_back(player);
+            task->weight += 4;
+        }
+        else
+            _serialPlayers.push_back(player);
+    }
+
+    if (fullTick)
+    {
+        for (WorldObject* obj : _updatableObjectList)
+        {
+            if (!obj->IsInWorld())
+                continue;
+
+            if (MapGridTask* task = GetObjectGridCoord(obj, gridX, gridY) ? GetOrCreateGridTask(gridX, gridY) : nullptr)
+            {
+                task->objects.push_back(obj);
+                ++task->weight;
+            }
+            else
+                _serialUpdatables.push_back(obj);
+        }
+    }
+
+    // Units registered for delayed visibility before this tick run in their grid's task
+    for (Unit* unit : i_objectsForDelayedVisibility)
+    {
+        MapGridTask* task = nullptr;
+        if (unit->IsInWorld() && unit->FindMap() == this && GetObjectGridCoord(unit, gridX, gridY))
+            task = GetOrCreateGridTask(gridX, gridY);
+
+        if (task)
+            task->delayedVisibility.push_back(unit);
+        else
+            _serialDelayedVisibility.push_back(unit);
+    }
+
+    i_objectsForDelayedVisibility.clear();
+}
+
+void Map::RunGridTask(MapGridTask& task, uint32 workerIndex, uint32 t_diff, uint32 s_diff, bool recheck)
+{
+    using Clock = std::chrono::steady_clock;
+
+    bool const inPhase = IsParallelPhase();
+    Clock::time_point const start = Clock::now();
+
+    MapThreading::Context& context = MapThreading::Current();
+    if (inPhase)
+    {
+        context.map = this;
+        context.workerIndex = workerIndex;
+        context.gridX = int32(task.x);
+        context.gridY = int32(task.y);
+    }
+
+    for (Player* player : task.players)
+    {
+        if (!player->IsInWorld() || player->FindMap() != this)
+            continue;
+
+        WorldSession* session = player->GetSession();
+        MapSessionFilter updater(session);
+        session->Update(s_diff, updater);
+
+        if (!t_diff)
+            player->Update(s_diff);
+    }
+
+    if (t_diff)
+    {
+        for (Player* player : task.players)
+        {
+            if (!player->IsInWorld() || player->FindMap() != this)
+                continue;
+
+            player->Update(s_diff);
+
+            if (recheck)
+            {
+                MarkNearbyCellsOf(player);
+
+                // If player is using far sight, update viewpoint
+                if (WorldObject* viewPoint = player->GetViewpoint())
+                {
+                    if (Creature* viewCreature = viewPoint->ToCreature())
+                        MarkNearbyCellsOf(viewCreature);
+                    else if (DynamicObject* viewObject = viewPoint->ToDynObject())
+                        MarkNearbyCellsOf(viewObject);
+                }
+            }
+        }
+
+        for (WorldObject* obj : task.objects)
+        {
+            if (!obj->IsInWorld())
+                continue;
+
+            obj->Update(t_diff);
+
+            // Removed after the phases, once every player marked its cells
+            if (recheck && !obj->IsUpdateNeeded())
+            {
+                if (inPhase)
+                    _scratch[workerIndex].updatableRemove.push_back(obj);
+                else
+                    _updatableRemovals.push_back(obj);
+            }
+        }
+    }
+
+    int32 gridX = 0;
+    int32 gridY = 0;
+    for (Unit* unit : task.delayedVisibility)
+    {
+        if (!inPhase || (unit->IsInWorld() && unit->FindMap() == this && GetObjectGridCoord(unit, gridX, gridY)
+            && gridX == int32(task.x) && gridY == int32(task.y)))
+            unit->ExecuteDelayedUnitRelocationEvent();
+        else
+            _scratch[workerIndex].delayedVisibilitySerial.push_back(unit);
+    }
+
+    if (inPhase)
+    {
+        context.map = nullptr;
+        context.workerIndex = 0;
+        context.gridX = -1;
+        context.gridY = -1;
+
+        double const ms = std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+        MapWorkerScratch& scratch = _scratch[workerIndex];
+        if (ms > scratch.heaviestTaskMs)
+        {
+            scratch.heaviestTaskMs = ms;
+            scratch.heaviestTaskX = task.x;
+            scratch.heaviestTaskY = task.y;
+            scratch.heaviestTaskPlayers = uint32(task.players.size());
+        }
+    }
+}
+
+namespace
+{
+    template<class T>
+    void AppendTo(std::vector<T>& target, std::vector<T> const& source)
+    {
+        target.insert(target.end(), source.begin(), source.end());
+    }
+}
+
+void Map::FinishPhase()
+{
+    std::vector<MapWorkerScratch::DeferredOp> deferred;
+    std::vector<GridCoord> gridLoads;
+
+    for (MapWorkerScratch& scratch : _scratch)
+    {
+        _updateObjects.insert(scratch.updateObjects.begin(), scratch.updateObjects.end());
+        for (Object* obj : scratch.updateObjectsRemoved)
+            if (!obj->IsInWorld())
+                _updateObjects.erase(obj);
+
+        i_objectsForDelayedVisibility.insert(scratch.delayedVisibility.begin(), scratch.delayedVisibility.end());
+        AppendTo(_serialDelayedVisibility, scratch.delayedVisibilitySerial);
+        AppendTo(_creaturesToMove, scratch.creaturesToMove);
+        AppendTo(_gameObjectsToMove, scratch.goToMove);
+        AppendTo(_dynamicObjectsToMove, scratch.dynToMove);
+        AppendTo(_updatableRemovals, scratch.updatableRemove);
+        AppendTo(gridLoads, scratch.gridLoads);
+        std::move(scratch.deferred.begin(), scratch.deferred.end(), std::back_inserter(deferred));
+
+        if (scratch.heaviestTaskMs > _threadingStats.heaviestTaskMs)
+        {
+            _threadingStats.heaviestTaskMs = scratch.heaviestTaskMs;
+            _threadingStats.heaviestTaskX = scratch.heaviestTaskX;
+            _threadingStats.heaviestTaskY = scratch.heaviestTaskY;
+            _threadingStats.heaviestTaskPlayers = scratch.heaviestTaskPlayers;
+        }
+
+        scratch.updateObjects.clear();
+        scratch.updateObjectsRemoved.clear();
+        scratch.delayedVisibility.clear();
+        scratch.delayedVisibilitySerial.clear();
+        scratch.creaturesToMove.clear();
+        scratch.goToMove.clear();
+        scratch.dynToMove.clear();
+        scratch.updatableRemove.clear();
+        scratch.gridLoads.clear();
+        scratch.deferred.clear();
+        scratch.heaviestTaskMs = 0.0;
+    }
+
+    _threadingStats.deferredOps += deferred.size();
+    for (MapWorkerScratch::DeferredOp& op : deferred)
+    {
+        if (op.target.IsEmpty())
+            op.fn(nullptr);
+        else if (WorldObject* obj = FindObjectForDeferredOp(op.target))
+            op.fn(obj);
+    }
+
+    _threadingStats.gridLoadsDeferred += gridLoads.size();
+    for (GridCoord const& gridCoord : gridLoads)
+        _mapGridManager.LoadGrid(gridCoord.x_coord, gridCoord.y_coord);
+
+    _mapCollisionData.LoadPendingTiles();
+    Balance();
+}
+
+void Map::UpdateParallel(uint32 t_diff, uint32 s_diff)
+{
+    using Clock = std::chrono::steady_clock;
+
+    if (!_workerPool)
+    {
+        _scratch.resize(_threadsPerMap);
+        _gridTaskIndex.assign(MAX_NUMBER_OF_GRIDS * MAX_NUMBER_OF_GRIDS, -1);
+        _workerPool = std::make_unique<MapWorkerPool>(_threadsPerMap - 1);
+        LOG_INFO("maps.threading", "Map {} ({}) updates on {} threads", GetId(), GetMapName(), _threadsPerMap);
+    }
+
+    if (t_diff)
+        _mapCollisionData.GetDynamicTree().update(t_diff);
+
+    Balance();
+
+    bool const fullTick = t_diff != 0;
+    bool recheck = false;
+    if (fullTick)
+    {
+        /// Process any due respawns (non-compatibility mode spawns)
+        if (!sWorld->getBoolConfig(CONFIG_RESPAWN_FORCE_COMPATIBILITY_MODE))
+        {
+            if (_respawnCheckTimer <= t_diff)
+            {
+                ProcessRespawns();
+                _respawnCheckTimer = 5000; // Check every 5 seconds
+            }
+            else
+                _respawnCheckTimer -= t_diff;
+        }
+
+        _updatableObjectListRecheckTimer.Update(t_diff);
+        recheck = _updatableObjectListRecheckTimer.Passed();
+        resetMarkedCells();
+
+        for (WorldObject* obj : _pendingAddUpdatableObjectList)
+            _AddObjectToUpdateList(obj);
+        _pendingAddUpdatableObjectList.clear();
+    }
+
+    BuildGridTasks(fullTick);
+
+    for (uint8 colour = 0; colour < 4; ++colour)
+    {
+        std::vector<uint32>& phaseTasks = _phaseTasks[colour];
+        if (phaseTasks.empty())
+            continue;
+
+        std::sort(phaseTasks.begin(), phaseTasks.end(), [this](uint32 a, uint32 b)
+        {
+            return _gridTasks[a].weight > _gridTasks[b].weight;
+        });
+
+        Clock::time_point const phaseStart = Clock::now();
+        std::atomic<std::size_t> nextTask{0};
+
+        _mapCollisionData.GetDynamicTree().SetDeferWrites(true);
+        _parallelPhase.store(true, std::memory_order_relaxed);
+
+        _workerPool->Run([&](uint32 workerIndex)
+        {
+            for (;;)
+            {
+                std::size_t const i = nextTask.fetch_add(1, std::memory_order_relaxed);
+                if (i >= phaseTasks.size())
+                    break;
+
+                RunGridTask(_gridTasks[phaseTasks[i]], workerIndex, t_diff, s_diff, recheck);
+            }
+        });
+
+        _parallelPhase.store(false, std::memory_order_relaxed);
+        _mapCollisionData.GetDynamicTree().SetDeferWrites(false);
+
+        _threadingStats.phaseMs[colour] += std::chrono::duration<double, std::milli>(Clock::now() - phaseStart).count();
+
+        FinishPhase();
+    }
+
+    // Players and objects without a valid grid update alone, outside the phases
+    if (!_serialPlayers.empty() || !_serialUpdatables.empty())
+    {
+        MapGridTask serialTask;
+        serialTask.players.swap(_serialPlayers);
+        serialTask.objects.swap(_serialUpdatables);
+        RunGridTask(serialTask, 0, t_diff, s_diff, recheck);
+        _serialPlayers.swap(serialTask.players);
+        _serialUpdatables.swap(serialTask.objects);
+    }
+
+    if (recheck)
+    {
+        for (WorldObject* obj : _updatableRemovals)
+        {
+            UpdatableMapObject* mapUpdatableObject = dynamic_cast<UpdatableMapObject*>(obj);
+            if (mapUpdatableObject && mapUpdatableObject->GetUpdateState() == UpdatableMapObject::UpdateState::Updating
+                && !obj->IsUpdateNeeded())
+                _RemoveObjectFromUpdateList(obj);
+        }
+
+        _updatableObjectListRecheckTimer.Reset();
+    }
+
+    _updatableRemovals.clear();
+
+    Clock::time_point const serialStart = Clock::now();
+
+    Events.Update(t_diff);
+
+    if (fullTick)
+    {
+        SendObjectUpdates();
+
+        ///- Process necessary scripts
+        if (!m_scriptSchedule.empty())
+        {
+            i_scriptLock = true;
+            ScriptsProcess();
+            i_scriptLock = false;
+        }
+
+        MoveAllCreaturesInMoveList();
+        MoveAllGameObjectsInMoveList();
+        MoveAllDynamicObjectsInMoveList();
+    }
+
+    // Units registered during this tick wait in i_objectsForDelayedVisibility for the next tick's grid tasks
+    for (Unit* unit : _serialDelayedVisibility)
+        unit->ExecuteDelayedUnitRelocationEvent();
+    _serialDelayedVisibility.clear();
+
+    if (fullTick)
+    {
+        UpdatePlayersRedirectKickEvent(t_diff);
+
+        UpdateWeather(t_diff);
+        UpdateExpiredCorpses(t_diff);
+
+        sScriptMgr->OnMapUpdate(this, t_diff);
+
+        METRIC_VALUE("map_creatures", uint64(GetObjectsStore().Size<Creature>()),
+            METRIC_TAG("map_id", std::to_string(GetId())),
+            METRIC_TAG("map_instanceid", std::to_string(GetInstanceId())));
+
+        METRIC_VALUE("map_gameobjects", uint64(GetObjectsStore().Size<GameObject>()),
+            METRIC_TAG("map_id", std::to_string(GetId())),
+            METRIC_TAG("map_instanceid", std::to_string(GetInstanceId())));
+    }
+
+    _threadingStats.serialMs += std::chrono::duration<double, std::milli>(Clock::now() - serialStart).count();
+    ++_threadingStats.ticks;
+
+    _threadingStatsTimer += s_diff;
+    if (_threadingStatsTimer >= 60 * IN_MILLISECONDS)
+    {
+        LogThreadingStats();
+        _threadingStatsTimer = 0;
+    }
+}
+
+void Map::LogThreadingStats()
+{
+    MapThreadingStats const& stats = _threadingStats;
+    double const ticks = stats.ticks ? double(stats.ticks) : 1.0;
+
+    LOG_INFO("maps.threading", "Map {} ({} threads): {} ticks, phase ms/tick {:.2f} / {:.2f} / {:.2f} / {:.2f}, "
+        "serial epilogue ms/tick {:.2f}, heaviest grid {:.2f} ms at [{},{}] with {} players, deferred ops {}, "
+        "grid loads deferred {}, violations: {}",
+        GetId(), _threadsPerMap, stats.ticks,
+        stats.phaseMs[0] / ticks, stats.phaseMs[1] / ticks, stats.phaseMs[2] / ticks, stats.phaseMs[3] / ticks,
+        stats.serialMs / ticks, stats.heaviestTaskMs, stats.heaviestTaskX, stats.heaviestTaskY,
+        stats.heaviestTaskPlayers, stats.deferredOps, stats.gridLoadsDeferred, MapThreading::TakeViolationSummary(this));
+
+    _threadingStats = MapThreadingStats();
+}
+
 void Map::AddObjectToPendingUpdateList(WorldObject* obj)
 {
     if (!obj->CanBeAddedToMapUpdateList())
         return;
 
     UpdatableMapObject* mapUpdatableObject = dynamic_cast<UpdatableMapObject*>(obj);
-    if (!mapUpdatableObject || mapUpdatableObject->GetUpdateState() != UpdatableMapObject::UpdateState::NotUpdating)
+    if (!mapUpdatableObject)
+        return;
+
+    std::unique_lock<std::mutex> guard(_pendingUpdatableLock, std::defer_lock);
+    if (IsParallelPhase())
+        guard.lock();
+
+    if (mapUpdatableObject->GetUpdateState() != UpdatableMapObject::UpdateState::NotUpdating)
         return;
 
     _pendingAddUpdatableObjectList.insert(obj);
@@ -626,6 +1218,11 @@ void Map::RemoveObjectFromMapUpdateList(WorldObject* obj)
         return;
 
     UpdatableMapObject* mapUpdatableObject = dynamic_cast<UpdatableMapObject*>(obj);
+
+    std::unique_lock<std::mutex> guard(_pendingUpdatableLock, std::defer_lock);
+    if (IsParallelPhase())
+        guard.lock();
+
     if (mapUpdatableObject->GetUpdateState() == UpdatableMapObject::UpdateState::PendingAdd)
         _pendingAddUpdatableObjectList.erase(obj);
     else if (mapUpdatableObject->GetUpdateState() == UpdatableMapObject::UpdateState::Updating)
@@ -674,11 +1271,13 @@ void Map::RemoveWorldObjectFromFarVisibleMap(WorldObject* obj)
 // Used in VisibilityDistanceType::Infinite
 void Map::AddWorldObjectToZoneWideVisibleMap(uint32 zoneId, WorldObject* obj)
 {
+    std::unique_lock<std::shared_mutex> guard(_zoneWideVisibleLock);
     _zoneWideVisibleWorldObjectsMap[zoneId].insert(obj);
 }
 
 void Map::RemoveWorldObjectFromZoneWideVisibleMap(uint32 zoneId, WorldObject* obj)
 {
+    std::unique_lock<std::shared_mutex> guard(_zoneWideVisibleLock);
     ZoneWideVisibleWorldObjectsMap::iterator itr = _zoneWideVisibleWorldObjectsMap.find(zoneId);
     if (itr == _zoneWideVisibleWorldObjectsMap.end())
         return;
@@ -688,11 +1287,22 @@ void Map::RemoveWorldObjectFromZoneWideVisibleMap(uint32 zoneId, WorldObject* ob
 
 ZoneWideVisibleWorldObjectsSet const* Map::GetZoneWideVisibleWorldObjectsForZone(uint32 zoneId) const
 {
+    std::shared_lock<std::shared_mutex> guard(_zoneWideVisibleLock);
     ZoneWideVisibleWorldObjectsMap::const_iterator itr = _zoneWideVisibleWorldObjectsMap.find(zoneId);
     if (itr == _zoneWideVisibleWorldObjectsMap.end())
         return nullptr;
 
     return &itr->second;
+}
+
+void Map::GetZoneWideVisibleWorldObjectsForZone(uint32 zoneId, std::vector<WorldObject*>& objects) const
+{
+    objects.clear();
+
+    std::shared_lock<std::shared_mutex> guard(_zoneWideVisibleLock);
+    ZoneWideVisibleWorldObjectsMap::const_iterator itr = _zoneWideVisibleWorldObjectsMap.find(zoneId);
+    if (itr != _zoneWideVisibleWorldObjectsMap.end())
+        objects.assign(itr->second.begin(), itr->second.end());
 }
 
 void Map::HandleDelayedVisibility()
@@ -702,6 +1312,23 @@ void Map::HandleDelayedVisibility()
     for (std::unordered_set<Unit*>::iterator itr = i_objectsForDelayedVisibility.begin(); itr != i_objectsForDelayedVisibility.end(); ++itr)
         (*itr)->ExecuteDelayedUnitRelocationEvent();
     i_objectsForDelayedVisibility.clear();
+}
+
+void Map::ForgetDelayedVisibility(Unit* unit)
+{
+    // The pointer is only a key here, the deferred erase never dereferences it
+    if (GetPhaseScratch())
+        DeferToPhaseEnd([this, unit]() { i_objectsForDelayedVisibility.erase(unit); });
+    else
+        i_objectsForDelayedVisibility.erase(unit);
+}
+
+void Map::AddUnitToDelayedVisibility(Unit* unit)
+{
+    if (MapWorkerScratch* scratch = GetPhaseScratch())
+        scratch->delayedVisibility.push_back(unit);
+    else
+        i_objectsForDelayedVisibility.insert(unit);
 }
 
 struct ResetNotifier
@@ -718,6 +1345,10 @@ struct ResetNotifier
 
 void Map::RemovePlayerFromMap(Player* player, bool remove)
 {
+    // With several threads per map the delayed visibility set lives across ticks
+    if (_threadsPerMap > 1)
+        ForgetDelayedVisibility(player);
+
     UpdatePlayerZoneStats(player->GetZoneId(), MAP_INVALID_ZONE);
 
     player->GetThreatMgr().RemoveMeFromThreatLists(); // pussywizard: multithreading crashfix
@@ -744,6 +1375,10 @@ void Map::AfterPlayerUnlinkFromMap()
 template<class T>
 void Map::RemoveFromMap(T* obj, bool remove)
 {
+    if constexpr (std::is_base_of_v<Unit, T>)
+        if (_threadsPerMap > 1)
+            ForgetDelayedVisibility(obj);
+
     obj->RemoveFromWorld();
 
     obj->RemoveFromGrid();
@@ -927,7 +1562,12 @@ void Map::DynamicObjectRelocation(DynamicObject* dynObj, float x, float y, float
 void Map::AddCreatureToMoveList(Creature* c)
 {
     if (c->_moveState == MAP_OBJECT_CELL_MOVE_NONE)
-        _creaturesToMove.push_back(c);
+    {
+        if (MapWorkerScratch* scratch = GetPhaseScratch())
+            scratch->creaturesToMove.push_back(c);
+        else
+            _creaturesToMove.push_back(c);
+    }
     c->_moveState = MAP_OBJECT_CELL_MOVE_ACTIVE;
 }
 
@@ -940,7 +1580,12 @@ void Map::RemoveCreatureFromMoveList(Creature* c)
 void Map::AddGameObjectToMoveList(GameObject* go)
 {
     if (go->_moveState == MAP_OBJECT_CELL_MOVE_NONE)
-        _gameObjectsToMove.push_back(go);
+    {
+        if (MapWorkerScratch* scratch = GetPhaseScratch())
+            scratch->goToMove.push_back(go);
+        else
+            _gameObjectsToMove.push_back(go);
+    }
     go->_moveState = MAP_OBJECT_CELL_MOVE_ACTIVE;
 }
 
@@ -953,7 +1598,12 @@ void Map::RemoveGameObjectFromMoveList(GameObject* go)
 void Map::AddDynamicObjectToMoveList(DynamicObject* dynObj)
 {
     if (dynObj->_moveState == MAP_OBJECT_CELL_MOVE_NONE)
-        _dynamicObjectsToMove.push_back(dynObj);
+    {
+        if (MapWorkerScratch* scratch = GetPhaseScratch())
+            scratch->dynToMove.push_back(dynObj);
+        else
+            _dynamicObjectsToMove.push_back(dynObj);
+    }
     dynObj->_moveState = MAP_OBJECT_CELL_MOVE_ACTIVE;
 }
 
@@ -1092,6 +1742,9 @@ void Map::UnloadAll()
     // clear all delayed moves, useless anyway do this moves before map unload.
     _creaturesToMove.clear();
     _gameObjectsToMove.clear();
+
+    if (_threadsPerMap > 1)
+        i_objectsForDelayedVisibility.clear();
 
     for (GridRefMgr<MapGridType>::iterator i = GridRefMgr<MapGridType>::begin(); i != GridRefMgr<MapGridType>::end();)
     {
@@ -1804,10 +2457,7 @@ uint32 Map::ApplyDynamicModeRespawnScaling(WorldObject const* obj, uint32 respaw
             return respawnDelay;
     }
 
-    auto it = _zonePlayerCountMap.find(obj->GetZoneId());
-    if (it == _zonePlayerCountMap.end())
-        return respawnDelay;
-    uint32 const playerCount = it->second;
+    uint32 const playerCount = GetPlayerCountInZone(obj->GetZoneId());
     if (!playerCount)
         return respawnDelay;
     double const adjustFactor =  rate / playerCount;
@@ -2450,23 +3100,45 @@ void BattlegroundMap::RemoveAllPlayers()
                     player->TeleportTo(player->GetEntryPoint());
 }
 
+std::unique_lock<std::shared_mutex> Map::LockObjectsStoreForWrite() const
+{
+    std::unique_lock<std::shared_mutex> guard(_objectsStoreLock, std::defer_lock);
+    if (IsParallelPhase())
+        guard.lock();
+
+    return guard;
+}
+
+std::shared_lock<std::shared_mutex> Map::LockObjectsStoreForRead() const
+{
+    std::shared_lock<std::shared_mutex> guard(_objectsStoreLock, std::defer_lock);
+    if (IsParallelPhase())
+        guard.lock();
+
+    return guard;
+}
+
 Corpse* Map::GetCorpse(ObjectGuid const& guid)
 {
+    auto guard = LockObjectsStoreForRead();
     return _objectsStore.Find<Corpse>(guid);
 }
 
 Creature* Map::GetCreature(ObjectGuid const& guid)
 {
+    auto guard = LockObjectsStoreForRead();
     return _objectsStore.Find<Creature>(guid);
 }
 
 GameObject* Map::GetGameObject(ObjectGuid const& guid)
 {
+    auto guard = LockObjectsStoreForRead();
     return _objectsStore.Find<GameObject>(guid);
 }
 
 Pet* Map::GetPet(ObjectGuid const& guid)
 {
+    auto guard = LockObjectsStoreForRead();
     return dynamic_cast<Pet*>(_objectsStore.Find<Creature>(guid));
 }
 
@@ -2481,6 +3153,7 @@ Transport* Map::GetTransport(ObjectGuid const& guid)
 
 DynamicObject* Map::GetDynamicObject(ObjectGuid const& guid)
 {
+    auto guard = LockObjectsStoreForRead();
     return _objectsStore.Find<DynamicObject>(guid);
 }
 
@@ -2503,13 +3176,17 @@ void Map::SaveCreatureRespawnTime(ObjectGuid::LowType spawnId, time_t& respawnTi
     if (GetInstanceResetPeriod() > 0 && respawnTime - now + 5 >= GetInstanceResetPeriod())
         respawnTime = now + YEAR;
 
-    // Remove old queue entry if updating an existing respawn time
-    auto itr = _creatureRespawnTimes.find(spawnId);
-    if (itr != _creatureRespawnTimes.end())
-        _respawnQueue.erase({itr->second, SPAWN_TYPE_CREATURE, spawnId});
+    {
+        std::lock_guard<std::mutex> guard(_respawnLock);
 
-    _creatureRespawnTimes[spawnId] = respawnTime;
-    _respawnQueue.insert({respawnTime, SPAWN_TYPE_CREATURE, spawnId});
+        // Remove old queue entry if updating an existing respawn time
+        auto itr = _creatureRespawnTimes.find(spawnId);
+        if (itr != _creatureRespawnTimes.end())
+            _respawnQueue.erase({itr->second, SPAWN_TYPE_CREATURE, spawnId});
+
+        _creatureRespawnTimes[spawnId] = respawnTime;
+        _respawnQueue.insert({respawnTime, SPAWN_TYPE_CREATURE, spawnId});
+    }
 
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_CREATURE_RESPAWN);
     stmt->SetData(0, spawnId);
@@ -2521,11 +3198,14 @@ void Map::SaveCreatureRespawnTime(ObjectGuid::LowType spawnId, time_t& respawnTi
 
 void Map::RemoveCreatureRespawnTime(ObjectGuid::LowType spawnId)
 {
-    auto itr = _creatureRespawnTimes.find(spawnId);
-    if (itr != _creatureRespawnTimes.end())
     {
-        _respawnQueue.erase({itr->second, SPAWN_TYPE_CREATURE, spawnId});
-        _creatureRespawnTimes.erase(itr);
+        std::lock_guard<std::mutex> guard(_respawnLock);
+        auto itr = _creatureRespawnTimes.find(spawnId);
+        if (itr != _creatureRespawnTimes.end())
+        {
+            _respawnQueue.erase({itr->second, SPAWN_TYPE_CREATURE, spawnId});
+            _creatureRespawnTimes.erase(itr);
+        }
     }
 
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_CREATURE_RESPAWN);
@@ -2539,6 +3219,8 @@ void Map::ForceCreatureRespawn(ObjectGuid::LowType spawnId)
 {
     time_t now = GameTime::GetGameTime().count();
     SaveCreatureRespawnTime(spawnId, now);
+
+    std::lock_guard<std::mutex> guard(_respawnLock);
     _forcedCreatureRespawns.insert(spawnId);
 }
 
@@ -2555,13 +3237,17 @@ void Map::SaveGORespawnTime(ObjectGuid::LowType spawnId, time_t& respawnTime)
     if (GetInstanceResetPeriod() > 0 && respawnTime - now + 5 >= GetInstanceResetPeriod())
         respawnTime = now + YEAR;
 
-    // Remove old queue entry if updating an existing respawn time
-    auto itr = _goRespawnTimes.find(spawnId);
-    if (itr != _goRespawnTimes.end())
-        _respawnQueue.erase({itr->second, SPAWN_TYPE_GAMEOBJECT, spawnId});
+    {
+        std::lock_guard<std::mutex> guard(_respawnLock);
 
-    _goRespawnTimes[spawnId] = respawnTime;
-    _respawnQueue.insert({respawnTime, SPAWN_TYPE_GAMEOBJECT, spawnId});
+        // Remove old queue entry if updating an existing respawn time
+        auto itr = _goRespawnTimes.find(spawnId);
+        if (itr != _goRespawnTimes.end())
+            _respawnQueue.erase({itr->second, SPAWN_TYPE_GAMEOBJECT, spawnId});
+
+        _goRespawnTimes[spawnId] = respawnTime;
+        _respawnQueue.insert({respawnTime, SPAWN_TYPE_GAMEOBJECT, spawnId});
+    }
 
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_REP_GO_RESPAWN);
     stmt->SetData(0, spawnId);
@@ -2573,11 +3259,14 @@ void Map::SaveGORespawnTime(ObjectGuid::LowType spawnId, time_t& respawnTime)
 
 void Map::RemoveGORespawnTime(ObjectGuid::LowType spawnId)
 {
-    auto itr = _goRespawnTimes.find(spawnId);
-    if (itr != _goRespawnTimes.end())
     {
-        _respawnQueue.erase({itr->second, SPAWN_TYPE_GAMEOBJECT, spawnId});
-        _goRespawnTimes.erase(itr);
+        std::lock_guard<std::mutex> guard(_respawnLock);
+        auto itr = _goRespawnTimes.find(spawnId);
+        if (itr != _goRespawnTimes.end())
+        {
+            _respawnQueue.erase({itr->second, SPAWN_TYPE_GAMEOBJECT, spawnId});
+            _goRespawnTimes.erase(itr);
+        }
     }
 
     CharacterDatabasePreparedStatement* stmt = CharacterDatabase.GetPreparedStatement(CHAR_DEL_GO_RESPAWN);
@@ -2624,9 +3313,12 @@ void Map::LoadRespawnTimes()
 
 void Map::DeleteRespawnTimes()
 {
-    _creatureRespawnTimes.clear();
-    _goRespawnTimes.clear();
-    _respawnQueue.clear();
+    {
+        std::lock_guard<std::mutex> guard(_respawnLock);
+        _creatureRespawnTimes.clear();
+        _goRespawnTimes.clear();
+        _respawnQueue.clear();
+    }
 
     DeleteRespawnTimesInDB(GetId(), GetInstanceId());
 }
@@ -2657,7 +3349,11 @@ bool Map::IsSpawnGroupActive(uint32 groupId) const
     // Per-map toggled state: XOR with default.
     // MANUAL_SPAWN groups default to inactive; toggling makes them active.
     // Non-MANUAL groups default to active; toggling makes them inactive.
-    bool toggled = _toggledSpawnGroupIds.count(groupId) != 0;
+    bool toggled = false;
+    {
+        std::lock_guard<std::mutex> guard(_respawnLock);
+        toggled = _toggledSpawnGroupIds.count(groupId) != 0;
+    }
     bool defaultActive = !(data->flags & SPAWNGROUP_FLAG_MANUAL_SPAWN);
     return toggled != defaultActive; // XOR: toggled flips the default
 }
@@ -2679,10 +3375,13 @@ bool Map::SpawnGroupSpawn(uint32 groupId, bool ignoreRespawn /*= false*/, bool f
     }
 
     // Mark group as active on this map (toggle to active state)
-    if (groupData->flags & SPAWNGROUP_FLAG_MANUAL_SPAWN)
-        _toggledSpawnGroupIds.insert(groupId);
-    else
-        _toggledSpawnGroupIds.erase(groupId);
+    {
+        std::lock_guard<std::mutex> guard(_respawnLock);
+        if (groupData->flags & SPAWNGROUP_FLAG_MANUAL_SPAWN)
+            _toggledSpawnGroupIds.insert(groupId);
+        else
+            _toggledSpawnGroupIds.erase(groupId);
+    }
 
     auto range = sObjectMgr->GetSpawnDataForGroup(groupId);
     for (auto it = range.first; it != range.second; ++it)
@@ -2695,17 +3394,25 @@ bool Map::SpawnGroupSpawn(uint32 groupId, bool ignoreRespawn /*= false*/, bool f
         {
             if (data->type == SPAWN_TYPE_CREATURE)
             {
-                auto bounds = _creatureBySpawnIdStore.equal_range(spawnId);
                 bool alive = false;
-                for (auto itr = bounds.first; itr != bounds.second; ++itr)
-                    if (itr->second->IsAlive())
-                        alive = true;
+                {
+                    auto guard = LockObjectsStoreForRead();
+                    auto bounds = _creatureBySpawnIdStore.equal_range(spawnId);
+                    for (auto itr = bounds.first; itr != bounds.second; ++itr)
+                        if (itr->second->IsAlive())
+                            alive = true;
+                }
                 if (alive)
                     continue;
             }
             else if (data->type == SPAWN_TYPE_GAMEOBJECT)
             {
-                if (_gameobjectBySpawnIdStore.count(spawnId))
+                bool spawned = false;
+                {
+                    auto guard = LockObjectsStoreForRead();
+                    spawned = _gameobjectBySpawnIdStore.count(spawnId) != 0;
+                }
+                if (spawned)
                     continue;
             }
         }
@@ -2763,10 +3470,13 @@ bool Map::SpawnGroupDespawn(uint32 groupId, bool deleteRespawnTimes /*= false*/)
     }
 
     // Mark group as inactive on this map (toggle to inactive state)
-    if (groupData->flags & SPAWNGROUP_FLAG_MANUAL_SPAWN)
-        _toggledSpawnGroupIds.erase(groupId);
-    else
-        _toggledSpawnGroupIds.insert(groupId);
+    {
+        std::lock_guard<std::mutex> guard(_respawnLock);
+        if (groupData->flags & SPAWNGROUP_FLAG_MANUAL_SPAWN)
+            _toggledSpawnGroupIds.erase(groupId);
+        else
+            _toggledSpawnGroupIds.insert(groupId);
+    }
 
     std::vector<WorldObject*> toUnload;
     auto range = sObjectMgr->GetSpawnDataForGroup(groupId);
@@ -2778,6 +3488,7 @@ bool Map::SpawnGroupDespawn(uint32 groupId, bool deleteRespawnTimes /*= false*/)
         if (deleteRespawnTimes)
             RemoveRespawnTime(data->type, spawnId);
 
+        auto guard = LockObjectsStoreForRead();
         switch (data->type)
         {
             case SPAWN_TYPE_CREATURE:
@@ -3111,6 +3822,7 @@ void Map::AddCorpse(Corpse* corpse)
     corpse->SetMap(this);
 
     GridCoord const gridCoord = Acore::ComputeGridCoord(corpse->GetPositionX(), corpse->GetPositionY());
+    std::lock_guard<std::mutex> guard(_corpseLock);
     _corpsesByGrid[gridCoord.GetId()].insert(corpse);
     if (corpse->GetType() != CORPSE_BONES)
         _corpsesByPlayer[corpse->GetOwnerGUID()] = corpse;
@@ -3132,6 +3844,7 @@ void Map::RemoveCorpse(Corpse* corpse)
         corpse->ResetMap();
     }
 
+    std::lock_guard<std::mutex> guard(_corpseLock);
     _corpsesByGrid[gridCoord.GetId()].erase(corpse);
     if (corpse->GetType() != CORPSE_BONES)
         _corpsesByPlayer.erase(corpse->GetOwnerGUID());
@@ -3197,19 +3910,25 @@ void Map::RemoveOldCorpses()
     time_t now = GameTime::GetGameTime().count();
 
     std::vector<ObjectGuid> corpses;
-    corpses.reserve(_corpsesByPlayer.size());
+    {
+        std::lock_guard<std::mutex> guard(_corpseLock);
+        corpses.reserve(_corpsesByPlayer.size());
 
-    for (auto const& p : _corpsesByPlayer)
-        if (p.second->IsExpired(now))
-            corpses.push_back(p.first);
+        for (auto const& p : _corpsesByPlayer)
+            if (p.second->IsExpired(now))
+                corpses.push_back(p.first);
+    }
 
     for (ObjectGuid const& ownerGuid : corpses)
         ConvertCorpseToBones(ownerGuid);
 
     std::vector<Corpse*> expiredBones;
-    for (Corpse* bones : _corpseBones)
-        if (bones->IsExpired(now))
-            expiredBones.push_back(bones);
+    {
+        std::lock_guard<std::mutex> guard(_corpseLock);
+        for (Corpse* bones : _corpseBones)
+            if (bones->IsExpired(now))
+                expiredBones.push_back(bones);
+    }
 
     for (Corpse* bones : expiredBones)
     {
@@ -3220,6 +3939,15 @@ void Map::RemoveOldCorpses()
 
 void Map::ScheduleCreatureRespawn(ObjectGuid creatureGuid, Milliseconds respawnTimer, Position pos)
 {
+    if (GetPhaseScratch())
+    {
+        DeferToPhaseEnd([this, creatureGuid, respawnTimer, pos]()
+        {
+            ScheduleCreatureRespawn(creatureGuid, respawnTimer, pos);
+        });
+        return;
+    }
+
     Events.AddEventAtOffset([this, creatureGuid, pos]()
     {
         if (Creature* creature = GetCreature(creatureGuid))
@@ -3260,6 +3988,7 @@ void Map::SendZoneText(uint32 zoneId, char const* text, WorldSession const* self
 
 void Map::SendZoneDynamicInfo(uint32 zoneId, Player* player) const
 {
+    std::lock_guard<std::recursive_mutex> guard(_zoneDynamicInfoLock);
     ZoneDynamicInfoMap::const_iterator itr = _zoneDynamicInfo.find(zoneId);
     if (itr == _zoneDynamicInfo.end())
         return;
@@ -3281,6 +4010,7 @@ void Map::SendZoneDynamicInfo(uint32 zoneId, Player* player) const
 
 void Map::SendZoneWeather(uint32 zoneId, Player* player) const
 {
+    std::lock_guard<std::recursive_mutex> guard(_zoneDynamicInfoLock);
     ZoneDynamicInfoMap::const_iterator itr = _zoneDynamicInfo.find(zoneId);
     if (itr == _zoneDynamicInfo.end())
         return;
@@ -3307,6 +4037,7 @@ void Map::UpdateWeather(uint32 const diff)
     if (!_weatherUpdateTimer.Passed())
         return;
 
+    std::lock_guard<std::recursive_mutex> guard(_zoneDynamicInfoLock);
     for (auto&& zoneInfo : _zoneDynamicInfo)
         if (zoneInfo.second.DefaultWeather && !zoneInfo.second.DefaultWeather->Update(_weatherUpdateTimer.GetInterval()))
             zoneInfo.second.DefaultWeather.reset();
@@ -3331,7 +4062,10 @@ void Map::PlayDirectSoundToMap(uint32 soundId, uint32 zoneId)
 
 void Map::SetZoneMusic(uint32 zoneId, uint32 musicId)
 {
-    _zoneDynamicInfo[zoneId].MusicId = musicId;
+    {
+        std::lock_guard<std::recursive_mutex> guard(_zoneDynamicInfoLock);
+        _zoneDynamicInfo[zoneId].MusicId = musicId;
+    }
 
     WorldPackets::Misc::PlayMusic playMusic(musicId);
     SendZoneMessage(zoneId, WorldPackets::Misc::PlayMusic(musicId).Write());
@@ -3343,6 +4077,7 @@ Weather* Map::GetOrGenerateZoneDefaultWeather(uint32 zoneId)
     if (!weatherData)
         return nullptr;
 
+    std::lock_guard<std::recursive_mutex> guard(_zoneDynamicInfoLock);
     ZoneDynamicInfo& info = _zoneDynamicInfo[zoneId];
 
     if (!info.DefaultWeather)
@@ -3357,18 +4092,24 @@ Weather* Map::GetOrGenerateZoneDefaultWeather(uint32 zoneId)
 
 void Map::SetZoneWeather(uint32 zoneId, WeatherState weatherId, float weatherGrade)
 {
-    ZoneDynamicInfo& info = _zoneDynamicInfo[zoneId];
-    info.WeatherId = weatherId;
-    info.WeatherGrade = weatherGrade;
+    {
+        std::lock_guard<std::recursive_mutex> guard(_zoneDynamicInfoLock);
+        ZoneDynamicInfo& info = _zoneDynamicInfo[zoneId];
+        info.WeatherId = weatherId;
+        info.WeatherGrade = weatherGrade;
+    }
 
     SendZoneMessage(zoneId, WorldPackets::Misc::Weather(weatherId, weatherGrade).Write());
 }
 
 void Map::SetZoneOverrideLight(uint32 zoneId, uint32 lightId, Milliseconds fadeInTime)
 {
-    ZoneDynamicInfo& info = _zoneDynamicInfo[zoneId];
-    info.OverrideLightId = lightId;
-    info.LightFadeInTime = static_cast<uint32>(fadeInTime.count());
+    {
+        std::lock_guard<std::recursive_mutex> guard(_zoneDynamicInfoLock);
+        ZoneDynamicInfo& info = _zoneDynamicInfo[zoneId];
+        info.OverrideLightId = lightId;
+        info.LightFadeInTime = static_cast<uint32>(fadeInTime.count());
+    }
 
     WorldPacket data(SMSG_OVERRIDE_LIGHT, 4 + 4 + 4);
     data << uint32(_defaultLight);

@@ -39,13 +39,23 @@
 #include "SpawnData.h"
 #include "Timer.h"
 #include "GridTerrainData.h"
+#include "MapThreading.h"
+#include <array>
+#include <atomic>
 #include <bitset>
+#include <functional>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <shared_mutex>
+#include <vector>
 
 class Unit;
+class Creature;
+class GameObject;
+class DynamicObject;
+class MapWorkerPool;
 class WorldPacket;
 class InstanceScript;
 class Group;
@@ -164,6 +174,33 @@ enum EncounterCreditType : uint8
     ENCOUNTER_CREDIT_CAST_SPELL     = 1,
 };
 
+// Per-worker containers of a map updated by several threads (MapUpdate.ThreadsPerMap > 1), filled while a
+// parallel phase runs and merged into the map's own containers at the phase boundary
+struct MapWorkerScratch
+{
+    struct DeferredOp
+    {
+        ObjectGuid target;                                  // empty: run with nullptr
+        std::function<void(WorldObject*)> fn;
+    };
+
+    std::vector<Object*> updateObjects;
+    std::vector<Object*> updateObjectsRemoved;
+    std::vector<Unit*> delayedVisibility;                   // registered this tick, carried to the next one
+    std::vector<Unit*> delayedVisibilitySerial;             // bucketed units that left their task's grid
+    std::vector<Creature*> creaturesToMove;
+    std::vector<GameObject*> goToMove;
+    std::vector<DynamicObject*> dynToMove;
+    std::vector<WorldObject*> updatableRemove;
+    std::vector<GridCoord> gridLoads;
+    std::vector<DeferredOp> deferred;
+
+    double heaviestTaskMs{0.0};
+    uint32 heaviestTaskX{0};
+    uint32 heaviestTaskY{0};
+    uint32 heaviestTaskPlayers{0};
+};
+
 class Map : public GridRefMgr<MapGridType>
 {
     friend class MapReference;
@@ -238,6 +275,22 @@ public:
     // pussywizard:
     std::unordered_set<Unit*> i_objectsForDelayedVisibility;
     void HandleDelayedVisibility();
+    void AddUnitToDelayedVisibility(Unit* unit);
+
+    // Intra-map threading (MapUpdate.ThreadsPerMap > 1 on continents), see MapThreading.h
+    [[nodiscard]] bool IsParallelPhase() const { return _parallelPhase.load(std::memory_order_relaxed); }
+    [[nodiscard]] bool CanWriteNow(WorldObject const* obj) const
+    {
+        return !IsParallelPhase() || MapThreading::IsWritable(obj);
+    }
+    // Runs fn(target) now when the current thread may write target, otherwise at the end of the running phase
+    // (target resolved again by GUID, skipped if gone). fn must capture values and GUIDs, never object pointers.
+    void RunOnOwner(WorldObject* target, std::function<void(WorldObject*)> fn);
+    void RunOnOwner(ObjectGuid target, std::function<void(WorldObject*)> fn);
+    [[nodiscard]] uint32 GetThreadsPerMap() const { return _threadsPerMap; }
+    void SetThreadsPerMap(uint32 threads);
+    // Grid of obj as the ownership rule sees it: a player's from its position, others' from their current cell
+    static bool GetObjectGridCoord(WorldObject const* obj, int32& gridX, int32& gridY);
 
     // some calls like isInWater should not use vmaps due to processor power
     // can return INVALID_HEIGHT if under z+2 z coord not found height
@@ -317,9 +370,19 @@ public:
     void AddObjectToRemoveList(WorldObject* obj);
     virtual void DelayedUpdate(const uint32 diff);
 
-    void resetMarkedCells() { marked_cells.reset(); }
-    bool isCellMarked(uint32 pCellId) { return marked_cells.test(pCellId); }
-    void markCell(uint32 pCellId) { marked_cells.set(pCellId); }
+    void resetMarkedCells()
+    {
+        for (std::atomic<uint64>& word : _markedCells)
+            word.store(0, std::memory_order_relaxed);
+    }
+    bool isCellMarked(uint32 pCellId)
+    {
+        return (_markedCells[pCellId >> 6].load(std::memory_order_relaxed) >> (pCellId & 63)) & 1;
+    }
+    void markCell(uint32 pCellId)
+    {
+        _markedCells[pCellId >> 6].fetch_or(uint64(1) << (pCellId & 63), std::memory_order_relaxed);
+    }
 
     [[nodiscard]] bool HavePlayers() const { return !m_mapRefMgr.IsEmpty(); }
     // When aliveOnly is true, counts only players that are alive and not in Spirit of Redemption form.
@@ -356,6 +419,10 @@ public:
     Pet* GetPet(ObjectGuid const& guid);
 
     MapStoredObjectTypesContainer& GetObjectsStore() { return _objectsStore; }
+    // Guards for the objects store and the spawn id stores; they lock only while a parallel phase runs.
+    // Do not insert into or remove from the stores while holding the read guard on the same thread.
+    [[nodiscard]] std::unique_lock<std::shared_mutex> LockObjectsStoreForWrite() const;
+    [[nodiscard]] std::shared_lock<std::shared_mutex> LockObjectsStoreForRead() const;
 
     typedef std::unordered_multimap<ObjectGuid::LowType, Creature*> CreatureBySpawnIdContainer;
     CreatureBySpawnIdContainer& GetCreatureBySpawnIdStore() { return _creatureBySpawnIdStore; }
@@ -365,6 +432,7 @@ public:
 
     [[nodiscard]] std::unordered_set<Corpse*> const* GetCorpsesInGrid(uint32 gridId) const
     {
+        std::lock_guard<std::mutex> guard(_corpseLock);
         auto itr = _corpsesByGrid.find(gridId);
         if (itr != _corpsesByGrid.end())
             return &itr->second;
@@ -374,6 +442,7 @@ public:
 
     [[nodiscard]] Corpse* GetCorpseByPlayer(ObjectGuid const& ownerGuid) const
     {
+        std::lock_guard<std::mutex> guard(_corpseLock);
         auto itr = _corpsesByPlayer.find(ownerGuid);
         if (itr != _corpsesByPlayer.end())
             return itr->second;
@@ -415,6 +484,7 @@ public:
     [[nodiscard]] time_t GetLinkedRespawnTime(ObjectGuid guid) const;
     [[nodiscard]] time_t GetCreatureRespawnTime(ObjectGuid::LowType dbGuid) const
     {
+        std::lock_guard<std::mutex> guard(_respawnLock);
         std::unordered_map<ObjectGuid::LowType /*dbGUID*/, time_t>::const_iterator itr = _creatureRespawnTimes.find(dbGuid);
         if (itr != _creatureRespawnTimes.end())
             return itr->second;
@@ -424,6 +494,7 @@ public:
 
     [[nodiscard]] time_t GetGORespawnTime(ObjectGuid::LowType dbGuid) const
     {
+        std::lock_guard<std::mutex> guard(_respawnLock);
         std::unordered_map<ObjectGuid::LowType /*dbGUID*/, time_t>::const_iterator itr = _goRespawnTimes.find(dbGuid);
         if (itr != _goRespawnTimes.end())
             return itr->second;
@@ -535,12 +606,18 @@ public:
 
     void AddUpdateObject(Object* obj)
     {
-        _updateObjects.insert(obj);
+        if (MapWorkerScratch* scratch = GetPhaseScratch())
+            scratch->updateObjects.push_back(obj);
+        else
+            _updateObjects.insert(obj);
     }
 
     void RemoveUpdateObject(Object* obj)
     {
-        _updateObjects.erase(obj);
+        if (MapWorkerScratch* scratch = GetPhaseScratch())
+            scratch->updateObjectsRemoved.push_back(obj);
+        else
+            _updateObjects.erase(obj);
     }
 
     size_t GetUpdatableObjectsCount() const { return _updatableObjectList.size(); }
@@ -563,9 +640,12 @@ public:
     void AddWorldObjectToZoneWideVisibleMap(uint32 zoneId, WorldObject* obj);
     void RemoveWorldObjectFromZoneWideVisibleMap(uint32 zoneId, WorldObject* obj);
     ZoneWideVisibleWorldObjectsSet const* GetZoneWideVisibleWorldObjectsForZone(uint32 zoneId) const;
+    // Copy taken under the zone-wide visibility lock; use this one from code that can run in a parallel phase
+    void GetZoneWideVisibleWorldObjectsForZone(uint32 zoneId, std::vector<WorldObject*>& objects) const;
 
     [[nodiscard]] uint32 GetPlayerCountInZone(uint32 zoneId) const
     {
+        std::lock_guard<std::mutex> guard(_zonePlayerCountLock);
         if (auto const& it = _zonePlayerCountMap.find(zoneId); it != _zonePlayerCountMap.end())
             return it->second;
 
@@ -576,6 +656,47 @@ public:
     MapCollisionData const& GetMapCollisionData()  const { return _mapCollisionData; }
 
 private:
+    struct MapGridTask
+    {
+        uint16 x{0};
+        uint16 y{0};
+        uint32 weight{0};
+        std::vector<Player*> players;
+        std::vector<WorldObject*> objects;
+        std::vector<Unit*> delayedVisibility;
+    };
+
+    struct MapThreadingStats
+    {
+        uint32 ticks{0};
+        std::array<double, 4> phaseMs{};
+        double serialMs{0.0};
+        double heaviestTaskMs{0.0};
+        uint32 heaviestTaskX{0};
+        uint32 heaviestTaskY{0};
+        uint32 heaviestTaskPlayers{0};
+        uint64 deferredOps{0};
+        uint64 gridLoadsDeferred{0};
+    };
+
+    MapWorkerScratch* GetPhaseScratch()
+    {
+        if (!IsParallelPhase())
+            return nullptr;
+
+        MapThreading::Context const& context = MapThreading::Current();
+        return context.map == this ? &_scratch[context.workerIndex] : nullptr;
+    }
+
+    void UpdateParallel(uint32 t_diff, uint32 s_diff);
+    MapGridTask* GetOrCreateGridTask(int32 gridX, int32 gridY);
+    void BuildGridTasks(bool fullTick);
+    void RunGridTask(MapGridTask& task, uint32 workerIndex, uint32 t_diff, uint32 s_diff, bool recheck);
+    void FinishPhase();
+    void DeferToPhaseEnd(std::function<void()> fn);
+    void ForgetDelayedVisibility(Unit* unit);
+    WorldObject* FindObjectForDeferredOp(ObjectGuid const& guid);
+    void LogThreadingStats();
 
     template<class T> void InitializeObject(T* obj);
     void AddCreatureToMoveList(Creature* c);
@@ -634,7 +755,8 @@ private:
     //InstanceMaps and BattlegroundMaps...
     Map* m_parentMap;
 
-    std::bitset<TOTAL_NUMBER_OF_CELLS_PER_MAP * TOTAL_NUMBER_OF_CELLS_PER_MAP> marked_cells;
+    static constexpr std::size_t MARKED_CELL_WORDS = (TOTAL_NUMBER_OF_CELLS_PER_MAP * TOTAL_NUMBER_OF_CELLS_PER_MAP + 63) / 64;
+    std::array<std::atomic<uint64>, MARKED_CELL_WORDS> _markedCells;
 
     bool i_scriptLock;
     std::unordered_set<WorldObject*> i_objectsToRemove;
@@ -712,6 +834,30 @@ private:
 
     TimeTrackerSmall _redirectKickTimer;
     TimeTrackerSmall _lastAnnounceRedirectKickTimer;
+
+    uint32 _threadsPerMap{1};
+    std::atomic<bool> _parallelPhase{false};
+    std::unique_ptr<MapWorkerPool> _workerPool;
+    std::vector<MapWorkerScratch> _scratch;
+    std::vector<MapGridTask> _gridTasks;
+    uint32 _gridTaskCount{0};
+    std::vector<int32> _gridTaskIndex;
+    std::array<std::vector<uint32>, 4> _phaseTasks;
+    std::vector<Player*> _serialPlayers;
+    std::vector<WorldObject*> _serialUpdatables;
+    std::vector<Unit*> _serialDelayedVisibility;
+    std::vector<WorldObject*> _updatableRemovals;
+    MapThreadingStats _threadingStats;
+    uint32 _threadingStatsTimer{0};
+
+    mutable std::shared_mutex _objectsStoreLock;
+    mutable std::mutex _corpseLock;
+    mutable std::mutex _respawnLock;
+    std::mutex _scriptScheduleLock;
+    mutable std::mutex _zonePlayerCountLock;
+    mutable std::recursive_mutex _zoneDynamicInfoLock;
+    mutable std::shared_mutex _zoneWideVisibleLock;
+    std::mutex _pendingUpdatableLock;
 };
 
 enum InstanceResetMethod

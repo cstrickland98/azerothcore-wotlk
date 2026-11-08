@@ -22,6 +22,8 @@
 #include "MapTree.h"
 #include "MMapMgr.h"
 #include "IVMapMgr.h"
+#include <mutex>
+#include <vector>
 
 class Map;
 
@@ -60,13 +62,15 @@ class MMapData
 
 public:
     dtNavMesh const* GetNavMesh() const { return _navMesh.get(); }
+    // Query of the calling thread: one per map worker (see MapUpdate.ThreadsPerMap), slot 0 outside a parallel phase
     dtNavMeshQuery const* GetNavMeshQuery();
 
 protected:
     // _navMesh is a shared_ptr as it will point to a parent maps nav mesh (if exists) to save on memory
     std::shared_ptr<dtNavMesh> _navMesh;
-    // navMeshQuery is not thread safe and needs its own instance per map
-    MMAP::ManagedNavMeshQuery _navMeshQuery;
+    // a navMeshQuery is not thread safe: one instance per map worker, each created by its own worker
+    std::vector<MMAP::ManagedNavMeshQuery> _navMeshQueries;
+    Map const* _map{nullptr};
 };
 
 // Map collision data holders (dynamic&static vmap, mmaps)
@@ -76,8 +80,11 @@ public:
     MapCollisionData(Map const& map, Map const* parentMap);
     ~MapCollisionData() = default;
 
+    // While a parallel phase of the map runs, tile loads are queued and run by LoadPendingTiles at the phase boundary
     int LoadVMapTile(uint32 tileX, uint32 tileY);
     int LoadMMapTile(uint32 tileX, uint32 tileY);
+    void LoadPendingTiles();
+    void SetWorkerCount(uint32 workers);
 
     DynamicVMapCollisionData& GetDynamicTree() { return _dynamicVMapData; }
     DynamicVMapCollisionData const& GetDynamicTree() const { return _dynamicVMapData; }
@@ -90,7 +97,16 @@ public:
     std::shared_ptr<dtNavMesh> const GetMMapNavMeshSharedPtr() const { return _mmapData._navMesh; }
 
 private:
+    struct PendingTile
+    {
+        uint32 x;
+        uint32 y;
+        bool mmap;
+    };
+
     Map const& _map;
+    std::mutex _pendingTilesLock;
+    std::vector<PendingTile> _pendingTiles;
 
     DynamicVMapCollisionData _dynamicVMapData;
     StaticVMapCollisionData _staticVMapData;
