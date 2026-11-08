@@ -736,6 +736,9 @@ Spell::Spell(WorldObject* caster, SpellInfo const* info, TriggerCastFlags trigge
 
 Spell::~Spell()
 {
+    if (_deferredAlive)
+        *_deferredAlive = false;
+
     // FindMap() check: pending spell events are destroyed after the caster has left the map,
     // where resolving a unit-summoned caster's owner through ObjectAccessor would assert
     if (Player* modOwner = (m_caster && m_caster->FindMap()) ? m_caster->GetSpellModOwner() : nullptr)
@@ -2623,11 +2626,93 @@ void Spell::AddDestTarget(SpellDestination const& dest, uint32 effIndex)
 
 void Spell::DoAllEffectOnTarget(TargetInfo* target)
 {
-    Unit* unitCaster = m_caster->ToUnit();
     if (!target || target->processed)
         return;
 
     target->processed = true;                               // Target checked in apply effects procedure
+
+    _DoAllEffectOnTarget(target);
+}
+
+/*
+ * Deferred unit targets (map updated by several threads, see Maps/MapThreading.h).
+ *
+ * A target the caster's task may not write (far after a teleport, a delayed projectile, a raid wide
+ * buff) is processed as a whole in the serial step after the phase, where every object is writable.
+ * Lifetime of the Spell until then:
+ *  - m_deferredTargets > 0 makes IsDeletable() false, so SpellEvent::Execute keeps re-adding the event,
+ *    EventProcessor::Update skips deleting it and KillAllEvents(false) (Unit / WorldObject cleanup
+ *    before leaving the map, ScriptedAI reset) keeps it.
+ *  - The only deletion of a non-deletable spell is a forced one: ~EventProcessor (KillAllEvents(true))
+ *    when the caster itself is destroyed, which never happens inside a phase (objects are deleted in
+ *    Map::RemoveAllObjectsInRemoveList / by the world thread, after the serial step). ~SpellEvent lets
+ *    such a spell be deleted (IsDeletableIgnoringDeferredTargets) instead of aborting, and ~Spell clears
+ *    _deferredAlive, which every op checks first, so an op outliving its spell does nothing.
+ *  - The op also does nothing when the caster left the world meanwhile.
+ * TargetInfo is looked up again by GUID (m_UniqueTargetInfo is not touched after the cast, but nothing
+ * depends on that). Single-threaded, or with a writable target, nothing changes.
+ */
+void Spell::DeferTargetToPhaseEnd(ObjectGuid targetGuid)
+{
+    if (!_deferredAlive)
+        _deferredAlive = std::make_shared<bool>(true);
+
+    ++m_deferredTargets;
+    uint32 const deferredState = m_spellState;
+    m_caster->GetMap()->DeferToPhaseEnd([this, alive = _deferredAlive, targetGuid, deferredState]()
+    {
+        if (!*alive)
+            return;
+
+        --m_deferredTargets;
+
+        if (!m_caster->IsInWorld())
+            return;
+
+        TargetInfo* target = nullptr;
+        for (TargetInfo& targetInfo : m_UniqueTargetInfo)
+        {
+            if (targetInfo.targetGUID == targetGuid)
+            {
+                target = &targetInfo;
+                break;
+            }
+        }
+
+        if (!target)
+            return;
+
+        // as UpdatePointers(): the original caster may have left the world since the phase
+        if (m_originalCasterGUID != m_caster->GetGUID())
+        {
+            m_originalCaster = ObjectAccessor::GetUnit(*m_caster, m_originalCasterGUID);
+            if (m_originalCaster && !m_originalCaster->IsInWorld())
+                m_originalCaster = nullptr;
+        }
+
+        // the spell may have finished meanwhile; process the target in the state it was deferred in
+        uint32 const currentState = m_spellState;
+        m_spellState = deferredState;
+
+        Player* modOwner = m_caster->GetSpellModOwner();
+        if (modOwner)
+            modOwner->SetSpellModTakingSpell(this, true);
+
+        PrepareTargetProcessing();
+        _DoAllEffectOnTarget(target);
+        FinishTargetProcessing();
+
+        if (modOwner)
+            modOwner->SetSpellModTakingSpell(this, false);
+
+        if (m_spellState == deferredState)              // keep a state the processing set (finish / cancel)
+            m_spellState = currentState;
+    });
+}
+
+void Spell::_DoAllEffectOnTarget(TargetInfo* target)
+{
+    Unit* unitCaster = m_caster->ToUnit();
 
     // Get mask of effects for target
     uint8 mask = target->effectMask;
@@ -2635,6 +2720,17 @@ void Spell::DoAllEffectOnTarget(TargetInfo* target)
     Unit* effectUnit = m_caster->GetGUID() == target->targetGUID ? unitCaster : ObjectAccessor::GetUnit(*m_caster, target->targetGUID);
     if (!effectUnit && !target->targetGUID.IsPlayer()) // only players may be targeted across maps
         return;
+
+    // a target the caster's map task may not write now: process it in the phase's serial step
+    if (effectUnit && effectUnit != unitCaster)
+    {
+        Map* map = m_caster->FindMap();
+        if (map && map->IsParallelPhase() && !map->CanWriteNow(effectUnit))
+        {
+            DeferTargetToPhaseEnd(target->targetGUID);
+            return;
+        }
+    }
 
     if (!effectUnit || m_spellInfo->Id == 45927)
     {
@@ -5803,19 +5899,41 @@ void Spell::HandleThreatSpells()
         if (!target)
             continue;
 
-        // positive spells distribute threat among all units that are in combat with target, like healing
-        if (m_spellInfo->_IsPositiveSpell())
-            target->GetThreatMgr().ForwardThreatForAssistingMe(unitCaster, threatToAdd, m_spellInfo);
-        // for negative spells threat gets distributed among affected targets
-        // ignoreModifiers=true because flat SpellThreatEntry threat should not have modifiers applied twice
-        else
+        auto addThreat = [](Unit* victim, Unit* threatCaster, float amount, SpellInfo const* spellInfo, bool fromPreDeathAura)
         {
-            if (!target->CanHaveThreatList())
-                continue;
-            if (IsFromPreDeathAura() && !target->IsEngagedBy(unitCaster))
-                continue;
-            target->GetThreatMgr().AddThreat(unitCaster, threatToAdd, m_spellInfo, true);
+            // positive spells distribute threat among all units that are in combat with target, like healing
+            if (spellInfo->_IsPositiveSpell())
+                victim->GetThreatMgr().ForwardThreatForAssistingMe(threatCaster, amount, spellInfo);
+            // for negative spells threat gets distributed among affected targets
+            // ignoreModifiers=true because flat SpellThreatEntry threat should not have modifiers applied twice
+            else
+            {
+                if (!victim->CanHaveThreatList())
+                    return;
+                if (fromPreDeathAura && !victim->IsEngagedBy(threatCaster))
+                    return;
+                victim->GetThreatMgr().AddThreat(threatCaster, amount, spellInfo, true);
+            }
+        };
+
+        // a target the caster's map task may not write now: add the threat in the phase's serial step
+        Map* map = unitCaster->FindMap();
+        if (map && !map->CanWriteNow(target))
+        {
+            map->RunOnOwner(target, [addThreat, casterGuid = unitCaster->GetGUID(), threatToAdd, spellId = m_spellInfo->Id, fromPreDeathAura = IsFromPreDeathAura()](WorldObject* obj)
+            {
+                Unit* victim = obj->ToUnit();
+                Unit* threatCaster = victim ? ObjectAccessor::GetUnit(*victim, casterGuid) : nullptr;
+                SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(spellId);
+                if (!threatCaster || !spellInfo)
+                    return;
+
+                addThreat(victim, threatCaster, threatToAdd, spellInfo, fromPreDeathAura);
+            });
+            continue;
         }
+
+        addThreat(target, unitCaster, threatToAdd, m_spellInfo, IsFromPreDeathAura());
     }
     LOG_DEBUG("spells.aura", "Spell {}, added an additional {} threat for {} {} target(s)", m_spellInfo->Id, threat, m_spellInfo->_IsPositiveSpell() ? "assisting" : "harming", uint32(m_UniqueTargetInfo.size()));
 }
@@ -8483,7 +8601,7 @@ SpellEvent::~SpellEvent()
     if (m_Spell->getState() != SPELL_STATE_FINISHED)
         m_Spell->cancel();
 
-    if (m_Spell->IsDeletable())
+    if (m_Spell->IsDeletableIgnoringDeferredTargets())
     {
         delete m_Spell;
     }
