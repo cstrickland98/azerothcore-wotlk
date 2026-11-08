@@ -5529,8 +5529,15 @@ void Unit::RemoveAreaAurasDueToLeaveWorld()
 
 void Unit::RemoveAllFollowers()
 {
-    while (!m_followingMe.empty())
-        (*m_followingMe.begin())->SetTarget(nullptr);
+    // Followers are other units' movement generators, updated by their own map tasks: clear their target under our
+    // lock without calling back into this set (SetTarget(nullptr) would). A generator being deleted meanwhile erases
+    // itself under the same lock, so it is still alive while we touch it, and FollowerAdded refuses new followers
+    // from here on (m_duringRemoveFromWorld, then !IsInWorld()).
+    std::lock_guard<Acore::SpinLock> guard(_followersLock);
+    for (AbstractFollower* follower : m_followingMe)
+        follower->TargetRemoved();
+
+    m_followingMe.clear();
 }
 
 void Unit::RemoveAllAuras()
