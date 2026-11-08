@@ -17,6 +17,7 @@
 
 #include "Totem.h"
 #include "Group.h"
+#include "Map.h"
 #include "ObjectMgr.h"
 #include "Player.h"
 #include "SpellAuraEffects.h"
@@ -140,40 +141,67 @@ void Totem::UnSummon(Milliseconds msTime)
 
     if (Unit* owner = GetOwner())
     {
-        // clear owner's totem slot
-        for (uint8 i = SUMMON_SLOT_TOTEM_FIRE; i < MAX_TOTEM_SLOT; ++i)
+        // the owner (and its group) can be far, in another task's area: it walked away from its totem. Its side is
+        // then updated on its owner; the lambda captures values only, the totem is leaving the world.
+        auto clearOwner = [totemGuid = GetGUID(), spellId = GetSpell(), entry = GetEntry(), createdBySpell = GetUInt32Value(UNIT_CREATED_BY_SPELL)](Unit* totemOwner)
         {
-            if (owner->m_SummonSlot[i] == GetGUID())
+            // clear owner's totem slot
+            for (uint8 i = SUMMON_SLOT_TOTEM_FIRE; i < MAX_TOTEM_SLOT; ++i)
             {
-                owner->m_SummonSlot[i].Clear();
-                break;
-            }
-        }
-
-        owner->RemoveAurasDueToSpell(GetSpell(), GetGUID());
-
-        // Remove Sentry Totem Aura
-        if (GetEntry() == SENTRY_TOTEM_ENTRY)
-            owner->RemoveAurasDueToSpell(static_cast<uint32>(TotemSpellIds::SentryTotemSpell));
-
-        //remove aura all party members too
-        if (Player* player = owner->ToPlayer())
-        {
-            player->SendAutoRepeatCancel(this);
-
-            if (SpellInfo const* spell = sSpellMgr->GetSpellInfo(GetUInt32Value(UNIT_CREATED_BY_SPELL)))
-                player->SendCooldownEvent(spell, 0, nullptr, false);
-
-            if (Group* group = player->GetGroup())
-            {
-                for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+                if (totemOwner->m_SummonSlot[i] == totemGuid)
                 {
-                    Player* target = itr->GetSource();
-                    if (target && target->IsInMap(player) && group->SameSubGroup(player, target))
-                        target->RemoveAurasDueToSpell(GetSpell(), GetGUID());
+                    totemOwner->m_SummonSlot[i].Clear();
+                    break;
                 }
             }
-        }
+
+            totemOwner->RemoveAurasDueToSpell(spellId, totemGuid);
+
+            // Remove Sentry Totem Aura
+            if (entry == SENTRY_TOTEM_ENTRY)
+                totemOwner->RemoveAurasDueToSpell(static_cast<uint32>(TotemSpellIds::SentryTotemSpell));
+
+            //remove aura all party members too
+            if (Player* player = totemOwner->ToPlayer())
+            {
+                // Player::SendAutoRepeatCancel(totem)
+                WorldPacket data(SMSG_CANCEL_AUTO_REPEAT, totemGuid.WriteAsPacked().size());
+                data << totemGuid.WriteAsPacked();
+                player->SendMessageToSet(&data, true);
+
+                if (SpellInfo const* spell = sSpellMgr->GetSpellInfo(createdBySpell))
+                    player->SendCooldownEvent(spell, 0, nullptr, false);
+
+                if (Group* group = player->GetGroup())
+                {
+                    Map* map = player->GetMap();
+                    for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
+                    {
+                        Player* target = itr->GetSource();
+                        if (!target || !target->IsInMap(player) || !group->SameSubGroup(player, target))
+                            continue;
+
+                        if (map->CanWriteNow(target))
+                            target->RemoveAurasDueToSpell(spellId, totemGuid);
+                        else
+                            map->RunOnOwner(target, [spellId, totemGuid](WorldObject* member)
+                            {
+                                if (Unit* unit = member->ToUnit())
+                                    unit->RemoveAurasDueToSpell(spellId, totemGuid);
+                            });
+                    }
+                }
+            }
+        };
+
+        if (GetMap()->CanWriteNow(owner))
+            clearOwner(owner);
+        else
+            GetMap()->RunOnOwner(owner, [clearOwner](WorldObject* target)
+            {
+                if (Unit* totemOwner = target->ToUnit())
+                    clearOwner(totemOwner);
+            });
     }
 
     AddObjectToRemoveList();
