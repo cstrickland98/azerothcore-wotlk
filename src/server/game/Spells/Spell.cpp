@@ -32,6 +32,7 @@
 #include "InstanceScript.h"
 #include "Log.h"
 #include "LootMgr.h"
+#include "MapThreading.h"
 #include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
@@ -3563,6 +3564,7 @@ bool Spell::UpdateChanneledTargetList()
 
 SpellCastResult Spell::prepare(SpellCastTargets const* targets, AuraEffect const* triggeredByAura)
 {
+    MT_ASSERT_WRITABLE(m_caster);
     Unit* unitCaster = m_caster->ToUnit();
     if (m_CastItem)
     {

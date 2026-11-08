@@ -26,6 +26,7 @@
 #include "HomeMovementGenerator.h"
 #include "IdleMovementGenerator.h"
 #include "Log.h"
+#include "MapThreading.h"
 #include "MoveSpline.h"
 #include "MoveSplineInit.h"
 #include "Player.h"
@@ -148,6 +149,7 @@ void MotionMaster::UpdateMotion(uint32 diff)
 
 void MotionMaster::DirectClean(bool reset)
 {
+    MT_ASSERT_WRITABLE(_owner);
     while (size() > 1)
     {
         MovementGenerator* curr = top();
@@ -166,6 +168,7 @@ void MotionMaster::DirectClean(bool reset)
 
 void MotionMaster::DelayedClean()
 {
+    MT_ASSERT_WRITABLE(_owner);
     while (size() > 1)
     {
         MovementGenerator* curr = top();
@@ -176,6 +179,7 @@ void MotionMaster::DelayedClean()
 
 void MotionMaster::DirectExpire(bool reset)
 {
+    MT_ASSERT_WRITABLE(_owner);
     if (size() > 1)
     {
         MovementGenerator* curr = top();
@@ -196,6 +200,7 @@ void MotionMaster::DirectExpire(bool reset)
 
 void MotionMaster::DelayedExpire()
 {
+    MT_ASSERT_WRITABLE(_owner);
     if (size() > 1)
     {
         MovementGenerator* curr = top();
@@ -983,6 +988,7 @@ void MotionMaster::MoveDistract(uint32 timer)
 
 void MotionMaster::Mutate(MovementGenerator* m, MovementSlot slot)
 {
+    MT_ASSERT_WRITABLE(_owner);
     bool const delayed = (_cleanFlag & MMCF_UPDATE);
 
     while (MovementGenerator* curr = Impl[slot])
@@ -1132,6 +1138,7 @@ void MotionMaster::InitTop()
 
 void MotionMaster::DirectDelete(_Ty curr)
 {
+    MT_ASSERT_WRITABLE(_owner);
     if (isStatic(curr))
         return;
     curr->Finalize(_owner);
