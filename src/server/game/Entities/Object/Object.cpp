@@ -28,6 +28,7 @@
 #include "GridNotifiers.h"
 #include "Log.h"
 #include "MapMgr.h"
+#include "MapThreading.h"
 #include "MiscPackets.h"
 #include "MovementPacketBuilder.h"
 #include "ObjectAccessor.h"
@@ -62,6 +63,19 @@
 //  there is probably some underlying problem with imports which should properly addressed
 //  see: https://github.com/azerothcore/azerothcore-wotlk/issues/9766
 #include "GridNotifiersImpl.h"
+
+// Items are Objects but not WorldObjects and have no grid; only world objects are checked.
+#ifdef ACORE_MAP_THREAD_CHECKS
+#define MT_ASSERT_FIELDS_WRITABLE() \
+    do \
+    { \
+        if (MapThreading::InParallelPhase() && isType(TYPEMASK_UNIT | TYPEMASK_PLAYER | TYPEMASK_GAMEOBJECT | \
+            TYPEMASK_DYNAMICOBJECT | TYPEMASK_CORPSE)) \
+            MT_ASSERT_WRITABLE(static_cast<WorldObject const*>(this)); \
+    } while (0)
+#else
+#define MT_ASSERT_FIELDS_WRITABLE() ((void)0)
+#endif
 
 constexpr float VisibilityDistances[AsUnderlyingType(VisibilityDistanceType::Max)] =
 {
@@ -634,6 +648,7 @@ bool Object::_LoadIntoDataField(std::string const& data, uint32 startOffset, uin
 
 void Object::SetInt32Value(uint16 index, int32 value)
 {
+    MT_ASSERT_FIELDS_WRITABLE();
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
 
     if (m_int32Values[index] != value)
@@ -647,6 +662,7 @@ void Object::SetInt32Value(uint16 index, int32 value)
 
 void Object::SetUInt32Value(uint16 index, uint32 value)
 {
+    MT_ASSERT_FIELDS_WRITABLE();
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
 
     if (m_uint32Values[index] != value)
@@ -660,6 +676,7 @@ void Object::SetUInt32Value(uint16 index, uint32 value)
 
 void Object::UpdateUInt32Value(uint16 index, uint32 value)
 {
+    MT_ASSERT_FIELDS_WRITABLE();
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
 
     m_uint32Values[index] = value;
@@ -668,6 +685,7 @@ void Object::UpdateUInt32Value(uint16 index, uint32 value)
 
 void Object::SetUInt64Value(uint16 index, uint64 value)
 {
+    MT_ASSERT_FIELDS_WRITABLE();
     ASSERT(index + 1 < m_valuesCount || PrintIndexError(index, true));
 
     if (*((uint64*) & (m_uint32Values[index])) != value)
@@ -683,6 +701,7 @@ void Object::SetUInt64Value(uint16 index, uint64 value)
 
 bool Object::AddGuidValue(uint16 index, ObjectGuid value)
 {
+    MT_ASSERT_FIELDS_WRITABLE();
     ASSERT(index + 1 < m_valuesCount || PrintIndexError(index, true));
 
     if (value && !*((ObjectGuid*)&(m_uint32Values[index])))
@@ -701,6 +720,7 @@ bool Object::AddGuidValue(uint16 index, ObjectGuid value)
 
 bool Object::RemoveGuidValue(uint16 index, ObjectGuid value)
 {
+    MT_ASSERT_FIELDS_WRITABLE();
     ASSERT(index + 1 < m_valuesCount || PrintIndexError(index, true));
 
     if (value && *((ObjectGuid*)&(m_uint32Values[index])) == value)
@@ -720,6 +740,7 @@ bool Object::RemoveGuidValue(uint16 index, ObjectGuid value)
 
 void Object::SetGuidValue(uint16 index, ObjectGuid value)
 {
+    MT_ASSERT_FIELDS_WRITABLE();
     ASSERT(index + 1 < m_valuesCount || PrintIndexError(index, true));
 
     if (*((ObjectGuid*)&(m_uint32Values[index])) != value)
@@ -734,6 +755,7 @@ void Object::SetGuidValue(uint16 index, ObjectGuid value)
 
 void Object::SetFloatValue(uint16 index, float value)
 {
+    MT_ASSERT_FIELDS_WRITABLE();
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
 
     if (m_floatValues[index] != value)
@@ -747,6 +769,7 @@ void Object::SetFloatValue(uint16 index, float value)
 
 void Object::SetByteValue(uint16 index, uint8 offset, uint8 value)
 {
+    MT_ASSERT_FIELDS_WRITABLE();
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
 
     if (offset > 3)
@@ -767,6 +790,7 @@ void Object::SetByteValue(uint16 index, uint8 offset, uint8 value)
 
 void Object::SetUInt16Value(uint16 index, uint8 offset, uint16 value)
 {
+    MT_ASSERT_FIELDS_WRITABLE();
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
 
     if (offset > 1)
@@ -835,6 +859,7 @@ void Object::ApplyModPositiveFloatValue(uint16 index, float  val, bool apply)
 
 void Object::SetFlag(uint16 index, uint32 newFlag)
 {
+    MT_ASSERT_FIELDS_WRITABLE();
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
     uint32 oldval = m_uint32Values[index];
     uint32 newval = oldval | newFlag;
@@ -850,6 +875,7 @@ void Object::SetFlag(uint16 index, uint32 newFlag)
 
 void Object::RemoveFlag(uint16 index, uint32 oldFlag)
 {
+    MT_ASSERT_FIELDS_WRITABLE();
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
     ASSERT(m_uint32Values);
 
@@ -901,6 +927,7 @@ void Object::ApplyModFlag(uint16 index, uint32 flag, bool apply)
 
 void Object::SetByteFlag(uint16 index, uint8 offset, uint8 newFlag)
 {
+    MT_ASSERT_FIELDS_WRITABLE();
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
 
     if (offset > 3)
@@ -920,6 +947,7 @@ void Object::SetByteFlag(uint16 index, uint8 offset, uint8 newFlag)
 
 void Object::RemoveByteFlag(uint16 index, uint8 offset, uint8 oldFlag)
 {
+    MT_ASSERT_FIELDS_WRITABLE();
     ASSERT(index < m_valuesCount || PrintIndexError(index, true));
 
     if (offset > 3)
