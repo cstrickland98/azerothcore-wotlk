@@ -19,6 +19,7 @@
 #include "GameObject.h"
 #include "GameObjectAI.h"
 #include "Log.h"
+#include "Map.h"
 #include "ObjectAccessor.h"
 #include "Pet.h"
 #include "Player.h"
@@ -313,10 +314,24 @@ void TempSummon::UnSummon(Milliseconds msTime)
 
     if (WorldObject* owner = GetSummoner())
     {
-        if (owner->IsCreature() && owner->ToCreature()->IsAIEnabled)
-            owner->ToCreature()->AI()->SummonedCreatureDespawn(this);
-        else if (owner->IsGameObject() && owner->ToGameObject()->AI())
-            owner->ToGameObject()->AI()->SummonedCreatureDespawn(this);
+        auto notifySummoner = [](WorldObject* summoner, Creature* summon)
+        {
+            if (summoner->IsCreature() && summoner->ToCreature()->IsAIEnabled)
+                summoner->ToCreature()->AI()->SummonedCreatureDespawn(summon);
+            else if (summoner->IsGameObject() && summoner->ToGameObject()->AI())
+                summoner->ToGameObject()->AI()->SummonedCreatureDespawn(summon);
+        };
+
+        // the summoner can be far, in another task's area: its AI is told on its owner (the summon is still in
+        // the map then, it leaves with the remove list)
+        if (GetMap()->CanWriteNow(owner))
+            notifySummoner(owner, this);
+        else
+            GetMap()->RunOnOwner(owner, [notifySummoner, summonGuid = GetGUID()](WorldObject* summoner)
+            {
+                if (Creature* summon = ObjectAccessor::GetCreature(*summoner, summonGuid))
+                    notifySummoner(summoner, summon);
+            });
     }
 
     AddObjectToRemoveList();
@@ -400,16 +415,34 @@ bool Minion::IsGuardianPet() const
 void Minion::setDeathState(DeathState s, bool despawn)
 {
     Creature::setDeathState(s, despawn);
-    if (s == DeathState::JustDied && IsGuardianPet())
-        if (Unit* owner = GetOwner())
-            if (owner->IsPlayer() && owner->GetMinionGUID() == GetGUID())
-                for (Unit::ControlSet::const_iterator itr = owner->m_Controlled.begin(); itr != owner->m_Controlled.end(); ++itr)
-                    if ((*itr)->IsAlive() && (*itr)->GetEntry() == GetEntry())
-                    {
-                        owner->SetMinionGUID((*itr)->GetGUID());
-                        owner->SetPetGUID((*itr)->GetGUID());
-                        owner->ToPlayer()->CharmSpellInitialize();
-                    }
+    if (s != DeathState::JustDied || !IsGuardianPet())
+        return;
+
+    Unit* owner = GetOwner();
+    if (!owner)
+        return;
+
+    // hands the owner's minion slot to a living minion of the same entry; the owner can be far, in another task's area
+    auto replaceMinion = [](Unit* minionOwner, ObjectGuid minionGuid, uint32 entry)
+    {
+        if (minionOwner->IsPlayer() && minionOwner->GetMinionGUID() == minionGuid)
+            for (Unit* controlled : minionOwner->m_Controlled)
+                if (controlled->IsAlive() && controlled->GetEntry() == entry)
+                {
+                    minionOwner->SetMinionGUID(controlled->GetGUID());
+                    minionOwner->SetPetGUID(controlled->GetGUID());
+                    minionOwner->ToPlayer()->CharmSpellInitialize();
+                }
+    };
+
+    if (GetMap()->CanWriteNow(owner))
+        replaceMinion(owner, GetGUID(), GetEntry());
+    else
+        GetMap()->RunOnOwner(owner, [replaceMinion, minionGuid = GetGUID(), entry = GetEntry()](WorldObject* target)
+        {
+            if (Unit* minionOwner = target->ToUnit())
+                replaceMinion(minionOwner, minionGuid, entry);
+        });
 }
 
 std::string Minion::GetDebugInfo() const
