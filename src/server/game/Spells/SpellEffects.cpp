@@ -67,6 +67,86 @@
 //  see: https://github.com/azerothcore/azerothcore-wotlk/issues/9766
 #include "GridNotifiersImpl.h"
 
+namespace
+{
+    // Runs fn(target) now when this thread may write target; otherwise target's map runs it after the parallel phase
+    // with target re-resolved by GUID (skipped if gone). For effects whose target is beyond spell range by design
+    // (the ghost of a corpse target, a summoned party member). fn captures values and GUIDs only.
+    template <class Fn>
+    void RunOnTarget(WorldObject const* source, WorldObject* target, Fn&& fn)
+    {
+        Map* map = source->GetMap();
+        if (map->CanWriteNow(target))
+        {
+            fn(target);
+            return;
+        }
+
+        map->RunOnOwner(target, std::forward<Fn>(fn));
+    }
+
+    // Stores a resurrect request from caster on target and sends it to target's client (Spell::SendResurrectRequest)
+    void RequestResurrect(Unit const* caster, Player* target, SpellInfo const* spellInfo, uint32 health, uint32 mana)
+    {
+        // get resurrector name for creature resurrections, otherwise packet will be not accepted
+        // for player resurrections the name is looked up by guid
+        std::string const sentName(caster->IsPlayer()
+                                   ? ""
+                                   : caster->GetNameForLocaleIdx(target->GetSession()->GetSessionDbLocaleIndex()));
+
+        WorldPacket data(SMSG_RESURRECT_REQUEST, (8 + 4 + sentName.size() + 1 + 1 + 1 + 4));
+        data << caster->GetGUID();
+        data << uint32(sentName.size() + 1);
+
+        data << sentName;
+        data << uint8(0); // null terminator
+
+        data << uint8(caster->IsPlayer() ? 0 : 1); // "you'll be afflicted with resurrection sickness"
+        // override delay sent with SMSG_CORPSE_RECLAIM_DELAY, set instant resurrection for spells with this attribute
+        if (spellInfo->HasAttribute(SPELL_ATTR3_NO_RES_TIMER))
+            data << uint32(0);
+
+        RunOnTarget(caster, target, [casterGuid = caster->GetGUID(), mapId = caster->GetMapId(),
+            x = caster->GetPositionX(), y = caster->GetPositionY(), z = caster->GetPositionZ(), health, mana,
+            data](WorldObject* obj) mutable
+        {
+            Player* player = obj->ToPlayer();
+            if (!player || player->IsAlive() || player->isResurrectRequested())
+                return;
+
+            player->setResurrectRequestData(casterGuid, mapId, x, y, z, health, mana);
+            player->SendDirectMessage(&data);
+        });
+    }
+
+    // Stores the summon point on target and asks its client to accept the summon
+    void RequestSummon(Unit const* summoner, Player* target, bool ignoreEvilTwin)
+    {
+        float x, y, z;
+        summoner->GetPosition(x, y, z);
+
+        WorldPacket data(SMSG_SUMMON_REQUEST, 8 + 4 + 4);
+        data << summoner->GetGUID();                                // summoner guid
+        data << uint32(summoner->GetZoneId());                      // summoner zone
+        data << uint32(MAX_PLAYER_SUMMON_DELAY * IN_MILLISECONDS);  // auto decline after msecs
+
+        RunOnTarget(summoner, target,
+            [mapId = summoner->GetMapId(), x, y, z, ignoreEvilTwin, data](WorldObject* obj) mutable
+        {
+            Player* player = obj->ToPlayer();
+            if (!player)
+                return;
+
+            // Evil Twin (ignore player summon, but hide this for summoner)
+            if (!ignoreEvilTwin && player->HasAura(23445))
+                return;
+
+            player->SetSummonPoint(mapId, x, y, z);
+            player->SendDirectMessage(&data);
+        });
+    }
+}
+
 pEffect SpellEffects[TOTAL_SPELL_EFFECTS] =
 {
     &Spell::EffectNULL,                                     //  0
@@ -272,8 +352,8 @@ void Spell::EffectResurrectNew(SpellEffIndex effIndex)
     uint32 health = damage;
     uint32 mana = m_spellInfo->Effects[effIndex].MiscValue;
     ExecuteLogEffectResurrect(effIndex, target);
-    target->setResurrectRequestData(unitCaster->GetGUID(), unitCaster->GetMapId(), unitCaster->GetPositionX(), unitCaster->GetPositionY(), unitCaster->GetPositionZ(), health, mana);
-    SendResurrectRequest(target);
+    // the ghost of a corpse target can be anywhere
+    RequestResurrect(unitCaster, target, m_spellInfo, health, mana);
 }
 
 void Spell::EffectInstaKill(SpellEffIndex /*effIndex*/)
@@ -743,7 +823,8 @@ void Spell::EffectDummy(SpellEffIndex effIndex)
                             if (!unitTarget)
                                 return;
                             // not empty (checked), copy
-                            Unit::AttackerSet attackers = unitTarget->getAttackers();
+                            Unit::AttackerSet attackersCopy;
+                            Unit::AttackerSet attackers = unitTarget->GetAttackersForIteration(attackersCopy);
 
                             // remove invalid attackers
                             for (Unit::AttackerSet::iterator aItr = attackers.begin(); aItr != attackers.end();)
@@ -4436,21 +4517,9 @@ void Spell::EffectSummonPlayer(SpellEffIndex /*effIndex*/)
         return;
     }
 
-    // Evil Twin (ignore player summon, but hide this for summoner)
     // Xinef: Unit Target may be on other map!!!, Need workaround
-    if (unitTarget->HasAura(23445))
-        return;
-
-    float x, y, z;
-    unitCaster->GetPosition(x, y, z);
-
-    player->SetSummonPoint(unitCaster->GetMapId(), x, y, z);
-
-    WorldPacket data(SMSG_SUMMON_REQUEST, 8 + 4 + 4);
-    data << unitCaster->GetGUID();                                // summoner guid
-    data << uint32(unitCaster->GetZoneId());                      // summoner zone
-    data << uint32(MAX_PLAYER_SUMMON_DELAY * IN_MILLISECONDS);  // auto decline after msecs
-    player->SendDirectMessage(&data);
+    // the party member can be anywhere: the Evil Twin check reads its auras where it is written
+    RequestSummon(unitCaster, player, false);
 }
 
 void Spell::EffectActivateObject(SpellEffIndex effIndex)
@@ -4893,8 +4962,8 @@ void Spell::EffectResurrect(SpellEffIndex effIndex)
 
     ExecuteLogEffectResurrect(effIndex, target);
 
-    target->setResurrectRequestData(unitCaster->GetGUID(), unitCaster->GetMapId(), unitCaster->GetPositionX(), unitCaster->GetPositionY(), unitCaster->GetPositionZ(), health, mana);
-    SendResurrectRequest(target);
+    // the ghost of a corpse target can be anywhere
+    RequestResurrect(unitCaster, target, m_spellInfo, health, mana);
 }
 
 void Spell::EffectAddExtraAttacks(SpellEffIndex effIndex)
@@ -5030,13 +5099,22 @@ void Spell::EffectForceDeselect(SpellEffIndex /*effIndex*/)
     Cell::VisitObjects(unitCaster, notifier, dist);
 
     // xinef: we should also force pets to remove us from current target
+    Unit::AttackerSet attackersCopy;
     Unit::AttackerSet attackerSet;
-    for (Unit::AttackerSet::const_iterator itr = unitCaster->getAttackers().begin(); itr != unitCaster->getAttackers().end(); ++itr)
-        if ((*itr)->IsCreature() && !(*itr)->CanHaveThreatList())
-            attackerSet.insert(*itr);
+    for (Unit* attacker : unitCaster->GetAttackersForIteration(attackersCopy))
+        if (attacker->IsCreature() && !attacker->CanHaveThreatList())
+            attackerSet.insert(attacker);
 
-    for (Unit::AttackerSet::const_iterator itr = attackerSet.begin(); itr != attackerSet.end(); ++itr)
-        (*itr)->AttackStop();
+    // an attacker keeps attacking at any distance
+    for (Unit* attacker : attackerSet)
+    {
+        RunOnTarget(unitCaster, attacker, [victimGuid = unitCaster->GetGUID()](WorldObject* obj)
+        {
+            Unit* unit = obj->ToUnit();
+            if (unit && unit->GetVictim() && unit->GetVictim()->GetGUID() == victimGuid)
+                unit->AttackStop();
+        });
+    }
 
     // Xinef: Mirror images code Initialize Images
     if (m_spellInfo->Id == 58836)
@@ -5892,7 +5970,14 @@ void Spell::EffectSkinPlayerCorpse(SpellEffIndex /*effIndex*/)
     if ((!unitCaster->IsPlayer()) || (!unitTarget->IsPlayer()) || (unitTarget->IsAlive()))
         return;
 
-    unitTarget->ToPlayer()->RemovedInsignia(unitCaster->ToPlayer());
+    // the ghost of the corpse can be anywhere
+    RunOnTarget(unitCaster, unitTarget, [looterGuid = unitCaster->GetGUID()](WorldObject* obj)
+    {
+        Player* victim = obj->ToPlayer();
+        Player* looter = ObjectAccessor::FindPlayer(looterGuid);
+        if (victim && looter && !victim->IsAlive())
+            victim->RemovedInsignia(looter);
+    });
 
     // We have a corpse object as the target.
     // This target was deleted in RemovedInsignia() -> ConvertCorpseToBones().
@@ -6700,12 +6785,6 @@ void Spell::EffectSummonRaFFriend(SpellEffIndex  /*effIndex*/)
         return;
     }
 
-    float x, y, z;
-    unitCaster->GetPosition(x, y, z);
-    unitTarget->ToPlayer()->SetSummonPoint(unitCaster->GetMapId(), x, y, z);
-    WorldPacket data(SMSG_SUMMON_REQUEST, 8 + 4 + 4);
-    data << unitCaster->GetGUID();
-    data << uint32(unitCaster->GetZoneId());
-    data << uint32(MAX_PLAYER_SUMMON_DELAY * IN_MILLISECONDS); // auto decline after msecs
-    player->SendDirectMessage(&data);
+    // the friend can be anywhere
+    RequestSummon(unitCaster, player, true);
 }
