@@ -23,6 +23,7 @@
 #include "GameObject.h"
 #include "QuestDef.h"
 #include <memory>
+#include <mutex>
 #include <type_traits>
 
 class Map;
@@ -48,6 +49,8 @@ class Pool                                                  // for Pool of Pool 
 typedef std::unordered_set<uint32> SpawnedPoolObjects;
 typedef std::map<uint32, uint32> SpawnedPoolPools;
 
+// Threads of one map (MapUpdate.ThreadsPerMap > 1) respawn pooled objects concurrently: every method locks, and
+// PoolMgr holds the lock across a whole spawn / despawn so a pool's count and its rolled objects stay consistent.
 class SpawnedPoolData
 {
 public:
@@ -72,8 +75,15 @@ public:
     template<typename T>
     void RemoveSpawn(uint32 db_guid_or_pool_id, uint32 pool_id);
 
-    SpawnedPoolObjects GetSpawnedQuests() const { return mSpawnedQuests; } // a copy of the set
+    SpawnedPoolObjects GetSpawnedQuests() const // a copy of the set
+    {
+        std::lock_guard<std::recursive_mutex> guard(mLock);
+        return mSpawnedQuests;
+    }
+
+    std::recursive_mutex& GetLock() const { return mLock; }
 private:
+    mutable std::recursive_mutex mLock;
     Map* mOwner;
     SpawnedPoolObjects mSpawnedCreatures;
     SpawnedPoolObjects mSpawnedGameobjects;
@@ -185,6 +195,8 @@ public:
 private:
     template<typename T>
     void SpawnPool(SpawnedPoolData& spawnedPoolData, uint32 pool_id, uint32 db_guid_or_pool_id);
+
+    uint32 GetPoolMaxLimit(uint32 pool_id) const;
 
     typedef std::unordered_map<uint32, PoolTemplateData>      PoolTemplateDataMap;
     typedef std::unordered_map<uint32, PoolGroup<Creature>>   PoolGroupCreatureMap;
