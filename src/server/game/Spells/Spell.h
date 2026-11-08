@@ -25,6 +25,7 @@
 #include "SharedDefines.h"
 #include "SpellInfo.h"
 #include "Unit.h"
+#include <memory>
 
 class Unit;
 class Player;
@@ -572,7 +573,10 @@ public:
     bool IsAutoActionResetSpell() const;
     bool IsIgnoringCooldowns() const;
 
-    bool IsDeletable() const { return !m_referencedFromCurrentSpell && !m_executedCurrently; }
+    bool IsDeletable() const { return !m_referencedFromCurrentSpell && !m_executedCurrently && !m_deferredTargets; }
+    // whether ~SpellEvent may delete the spell: targets deferred to the map phase's serial step do
+    // not block a forced delete (their ops see _deferredAlive cleared and do nothing)
+    bool IsDeletableIgnoringDeferredTargets() const { return !m_referencedFromCurrentSpell && !m_executedCurrently; }
     void SetReferencedFromCurrent(bool yes) { m_referencedFromCurrentSpell = yes; }
     bool IsInterruptable() const { return !m_executedCurrently; }
     void SetExecutedCurrently(bool yes) {m_executedCurrently = yes;}
@@ -671,6 +675,12 @@ public:
     // These vars are used in both delayed spell system and modified immediate spell system
     bool m_referencedFromCurrentSpell;                  // mark as references to prevent deleted and access by dead pointers
     bool m_executedCurrently;                           // mark as executed to prevent deleted and access by dead pointers
+    // Unit targets whose processing was deferred to the serial step of the caster map's parallel phase
+    // (DeferTargetToPhaseEnd); IsDeletable() is false while any is pending. Written by the caster's task
+    // and by the serial step only.
+    uint32 m_deferredTargets = 0;
+    // shared with the deferred ops; ~Spell sets it false so an op left behind by a forced delete is a no-op
+    std::shared_ptr<bool> _deferredAlive;
     bool m_needComboPoints;
     uint8 m_applyMultiplierMask;
     float m_damageMultipliers[3];
@@ -738,6 +748,8 @@ public:
     void AddDestTarget(SpellDestination const& dest, uint32 effIndex);
 
     void DoAllEffectOnTarget(TargetInfo* target);
+    void _DoAllEffectOnTarget(TargetInfo* target);      // DoAllEffectOnTarget once target->processed is set
+    void DeferTargetToPhaseEnd(ObjectGuid targetGuid);
     SpellMissInfo DoSpellHitOnUnit(Unit* unit, uint32 effectMask, bool scaleAura);
     void DoTriggersOnSpellHit(Unit* unit, uint8 effMask);
     void DoAllEffectOnTarget(GOTargetInfo* target);
