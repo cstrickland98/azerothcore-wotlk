@@ -51,7 +51,11 @@ void Map::ScriptsStart(ScriptMapMap const& scripts, uint32 id, Object* source, O
         sa.ownerGUID  = ownerGUID;
 
         sa.script = &iter->second;
-        m_scriptSchedule.insert(ScriptScheduleMap::value_type(time_t(GameTime::GetGameTime().count() + iter->first), sa));
+        {
+            std::lock_guard<std::mutex> guard(_scriptScheduleLock);
+            time_t const when = time_t(GameTime::GetGameTime().count() + iter->first);
+            m_scriptSchedule.insert(ScriptScheduleMap::value_type(when, sa));
+        }
         if (iter->first == 0)
             immedScript = true;
 
@@ -81,7 +85,10 @@ void Map::ScriptCommandStart(ScriptInfo const& script, uint32 delay, Object* sou
     sa.ownerGUID  = ownerGUID;
 
     sa.script = &script;
-    m_scriptSchedule.insert(ScriptScheduleMap::value_type(time_t(GameTime::GetGameTime().count() + delay), sa));
+    {
+        std::lock_guard<std::mutex> guard(_scriptScheduleLock);
+        m_scriptSchedule.insert(ScriptScheduleMap::value_type(time_t(GameTime::GetGameTime().count() + delay), sa));
+    }
 
     sScriptMgr->IncreaseScheduledScriptsCount();
 
