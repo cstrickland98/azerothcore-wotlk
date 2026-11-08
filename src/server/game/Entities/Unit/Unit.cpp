@@ -5393,6 +5393,10 @@ void Unit::RemoveSingleCastAurasIf(std::function<bool(Aura const*)> const& pred)
                 ownerWritable = false;
                 ownerGuid = owner->GetGUID();
                 spellId = aura->GetId();
+                // Unregister it now: by the serial step this unit may have left the world (RemoveFromWorld is the
+                // main caller), and Aura::UnregisterSingleTarget cannot find a caster that is out of the world,
+                // which would leave the deleted aura in this list
+                m_scAuras.remove(aura);
             }
         }
 
@@ -5403,15 +5407,22 @@ void Unit::RemoveSingleCastAurasIf(std::function<bool(Aura const*)> const& pred)
             continue;
         }
 
-        map->RunOnOwner(ownerGuid, [spellId, casterGuid = GetGUID()](WorldObject* target)
+        // `this` stays allocated through the serial step of the running phase (objects are deleted after it)
+        map->RunOnOwner(ownerGuid, [this, spellId, casterGuid = GetGUID()](WorldObject* target)
         {
             Unit* owner = target->ToUnit();
             if (!owner)
                 return;
 
-            if (Aura* ownedAura = owner->GetOwnedAura(spellId, casterGuid))
-                if (ownedAura->IsSingleTarget())
-                    ownedAura->Remove();
+            Aura* ownedAura = owner->GetOwnedAura(spellId, casterGuid);
+            if (!ownedAura || !ownedAura->IsSingleTarget())
+                return;
+
+            // a newer aura of the same spell may have replaced the one we unregistered: drop that one from the
+            // list too, and remove without UnregisterSingleTarget (the caster may be out of the world by now)
+            RemoveSingleCastAura(ownedAura);
+            ownedAura->SetIsSingleTarget(false);
+            ownedAura->Remove();
         });
     }
 }

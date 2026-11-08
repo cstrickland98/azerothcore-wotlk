@@ -2186,10 +2186,6 @@ protected:
     void _UpdateSpells(uint32 time);
     void _DeleteRemovedAuras();
 
-    // Unlocked raw access, kept only for Player::ActivateSpec until it moves to RemoveSingleCastAurasIf: other
-    // units' tasks unregister from this list under _scAurasLock
-    AuraList& GetSingleCastAuras() { return m_scAuras; }
-
     void _UpdateAutoRepeatSpell();
 
     bool CanSparringWith(Unit const* attacker) const;   ///@brief: Check if unit is eligible for sparring damages. Work only if attacker and victim are creatures.
