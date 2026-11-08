@@ -311,6 +311,7 @@ Creature* ObjectAccessor::GetSpawnedCreatureByDBGUID(uint32 mapId, uint64 guid)
 {
     if (Map* map = sMapMgr->FindBaseMap(mapId))
     {
+        auto guard = map->LockObjectsStoreForRead();
         auto bounds = map->GetCreatureBySpawnIdStore().equal_range(guid);
 
         if (bounds.first == bounds.second)
@@ -337,6 +338,7 @@ GameObject* ObjectAccessor::GetSpawnedGameObjectByDBGUID(uint32 mapId, uint64 gu
 {
     if (Map* map = sMapMgr->FindBaseMap(mapId))
     {
+        auto guard = map->LockObjectsStoreForRead();
         auto bounds = map->GetGameObjectBySpawnIdStore().equal_range(guid);
 
         if (bounds.first == bounds.second)

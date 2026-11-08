@@ -19,6 +19,8 @@
 #include "DetourNavMeshQuery.h"
 #include "DisableMgr.h"
 #include "MapCollisionData.h"
+#include "Map.h"
+#include "MapThreading.h"
 #include "MapTree.h"
 #include "ModelInstance.h"
 #include "VMapFactory.h"
@@ -28,9 +30,18 @@
 
 #include <G3D/Vector3.h>
 
+namespace
+{
+    // dtNavMesh::addTile is not thread safe and instances of one map share their parent's nav mesh
+    std::mutex MMapTileLoadLock;
+}
+
 MapCollisionData::MapCollisionData(Map const& map, Map const* parentMap) :
     _map(map), _staticVMapData(map.GetId())
 {
+    _mmapData._map = &map;
+    _mmapData._navMeshQueries.resize(1);
+
     if (parentMap)
     {
         // If we have a parent map, point our static tree and mmap nav mesh to the parent maps
@@ -51,6 +62,13 @@ MapCollisionData::MapCollisionData(Map const& map, Map const* parentMap) :
 
 int MapCollisionData::LoadVMapTile(uint32 tileX, uint32 tileY)
 {
+    if (_map.IsParallelPhase())
+    {
+        std::lock_guard<std::mutex> guard(_pendingTilesLock);
+        _pendingTiles.push_back({ tileX, tileY, false });
+        return VMAP::VMAP_LOAD_RESULT_IGNORED;
+    }
+
     if (!VMAP::VMapFactory::createOrGetVMapMgr()->isMapLoadingEnabled() || !_staticVMapData._staticTree)
         return VMAP::VMAP_LOAD_RESULT_IGNORED;
 
@@ -65,7 +83,38 @@ int MapCollisionData::LoadMMapTile(uint32 tileX, uint32 tileY)
     if (!DisableMgr::IsPathfindingEnabled(&_map) || !_mmapData._navMesh)
         return MMAP::MMAP_LOAD_RESULT_IGNORED;
 
+    if (_map.IsParallelPhase())
+    {
+        std::lock_guard<std::mutex> guard(_pendingTilesLock);
+        _pendingTiles.push_back({ tileX, tileY, true });
+        return MMAP::MMAP_LOAD_RESULT_IGNORED;
+    }
+
+    std::lock_guard<std::mutex> guard(MMapTileLoadLock);
     return MMAP::MMapMgr::LoadTile(_mmapData._navMesh.get(), _map.GetId(), tileX, tileY);
+}
+
+void MapCollisionData::LoadPendingTiles()
+{
+    std::vector<PendingTile> tiles;
+    {
+        std::lock_guard<std::mutex> guard(_pendingTilesLock);
+        tiles.swap(_pendingTiles);
+    }
+
+    for (PendingTile const& tile : tiles)
+    {
+        if (tile.mmap)
+            LoadMMapTile(tile.x, tile.y);
+        else
+            LoadVMapTile(tile.x, tile.y);
+    }
+}
+
+void MapCollisionData::SetWorkerCount(uint32 workers)
+{
+    if (workers > _mmapData._navMeshQueries.size())
+        _mmapData._navMeshQueries.resize(workers);
 }
 
 bool StaticVMapCollisionData::isInLineOfSight(float x1, float y1, float z1, float x2, float y2, float z2, VMAP::ModelIgnoreFlags ignoreFlags) const
@@ -176,8 +225,14 @@ bool DynamicVMapCollisionData::GetObjectHitPos(uint32 phasemask, float x1, float
 
 dtNavMeshQuery const* MMapData::GetNavMeshQuery()
 {
-    if (_navMesh && !_navMeshQuery)
-        _navMeshQuery = MMAP::MMapMgr::CreateNavMeshQuery(_navMesh.get());
+    std::size_t index = 0;
+    MapThreading::Context const& context = MapThreading::Current();
+    if (context.map && context.map == _map && context.workerIndex < _navMeshQueries.size())
+        index = context.workerIndex;
 
-    return _navMeshQuery.get();
+    MMAP::ManagedNavMeshQuery& query = _navMeshQueries[index];
+    if (_navMesh && !query)
+        query = MMAP::MMapMgr::CreateNavMeshQuery(_navMesh.get());
+
+    return query.get();
 }

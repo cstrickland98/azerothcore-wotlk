@@ -20,7 +20,11 @@
 
 #include "GridCell.h"
 #include "GridReference.h"
+#include "MapThreading.h"
 #include <memory>
+#include <mutex>
+#include <shared_mutex>
+#include <type_traits>
 
 class GridTerrainData;
 
@@ -58,12 +62,16 @@ public:
 
     template<class SPECIFIC_OBJECT> void AddFarVisibleObject(uint16 const x, uint16 const y, SPECIFIC_OBJECT* obj)
     {
-        GetOrCreateCell(x, y).AddFarVisibleObject(obj);
+        GridCellType& cell = GetOrCreateCell(x, y);
+        std::unique_lock<std::shared_mutex> guard = LockFarVisibleForWrite();
+        cell.AddFarVisibleObject(obj);
     }
 
     template<class SPECIFIC_OBJECT> void RemoveFarVisibleObject(uint16 const x, uint16 const y, SPECIFIC_OBJECT* obj)
     {
-        GetOrCreateCell(x, y).RemoveFarVisibleObject(obj);
+        GridCellType& cell = GetOrCreateCell(x, y);
+        std::unique_lock<std::shared_mutex> guard = LockFarVisibleForWrite();
+        cell.RemoveFarVisibleObject(obj);
     }
 
     // Visit all cells
@@ -86,11 +94,31 @@ public:
     template<class T, class TT>
     void VisitCell(uint16 const x, uint16 const y, TypeContainerVisitor<T, TT>& visitor)
     {
+        if (!MapThreading::InParallelPhase())
+        {
+            if (GridCellType* gridCell = GetCell(x, y))
+                gridCell->Visit(visitor);
+
+            return;
+        }
+
+        // In a parallel phase cells of this grid can be created, and its far visible lists changed, by the task of
+        // another grid: the far visible lists are read under the lock, the other lists are owned by this thread
+        std::shared_lock<std::shared_mutex> guard(_cellLock);
         GridCellType* gridCell = GetCell(x, y);
         if (!gridCell)
             return;
 
-        gridCell->Visit(visitor);
+        if constexpr (std::is_same_v<TT, TypeVectorContainer<FAR_VISIBLE_OBJECT_TYPES>>)
+        {
+            FarVisibleReadScope const readScope(&_cellLock);
+            gridCell->Visit(visitor);
+        }
+        else
+        {
+            guard.unlock();
+            gridCell->Visit(visitor);
+        }
     }
 
     void link(GridRefMgr<MapGrid<GRID_OBJECT_TYPES, FAR_VISIBLE_OBJECT_TYPES>>* pTo)
@@ -119,11 +147,54 @@ public:
     }
 
 private:
+    // Marks the far visible lock this thread reads under, so that a visitor changing a far visible list of the
+    // same grid does not wait for itself
+    struct FarVisibleReadScope
+    {
+        explicit FarVisibleReadScope(std::shared_mutex const* lock) : _previous(HeldFarVisibleLock())
+        {
+            HeldFarVisibleLock() = lock;
+        }
+
+        ~FarVisibleReadScope() { HeldFarVisibleLock() = _previous; }
+
+        std::shared_mutex const* _previous;
+    };
+
+    static std::shared_mutex const*& HeldFarVisibleLock()
+    {
+        thread_local std::shared_mutex const* held = nullptr;
+        return held;
+    }
+
+    std::unique_lock<std::shared_mutex> LockFarVisibleForWrite()
+    {
+        std::unique_lock<std::shared_mutex> guard(_cellLock, std::defer_lock);
+        if (MapThreading::InParallelPhase() && HeldFarVisibleLock() != &_cellLock)
+            guard.lock();
+
+        return guard;
+    }
+
     // Creates and returns the cell if not already created
     GridCellType& GetOrCreateCell(uint16 const x, uint16 const y)
     {
-        GridCellType* cell = GetCell(x, y);
-        if (!cell)
+        if (!MapThreading::InParallelPhase() || HeldFarVisibleLock() == &_cellLock)
+        {
+            if (!_cells[x][y])
+                _cells[x][y] = std::make_unique<GridCellType>();
+
+            return *_cells[x][y];
+        }
+
+        {
+            std::shared_lock<std::shared_mutex> guard(_cellLock);
+            if (GridCellType* cell = GetCell(x, y))
+                return *cell;
+        }
+
+        std::unique_lock<std::shared_mutex> guard(_cellLock);
+        if (!_cells[x][y])
             _cells[x][y] = std::make_unique<GridCellType>();
 
         return *_cells[x][y];
@@ -145,6 +216,7 @@ private:
     uint16 _y;
 
     bool _objectDataLoaded;
+    mutable std::shared_mutex _cellLock;
     std::array<std::array<std::unique_ptr<GridCellType>, MAX_NUMBER_OF_CELLS>, MAX_NUMBER_OF_CELLS> _cells; // N * N array
     GridReference<MapGrid<GRID_OBJECT_TYPES, FAR_VISIBLE_OBJECT_TYPES>> _gridReference;
 

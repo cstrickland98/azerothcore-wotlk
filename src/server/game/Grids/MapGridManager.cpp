@@ -25,6 +25,7 @@ void MapGridManager::CreateGrid(uint16 const x, uint16 const y)
     loader.LoadTerrain();
 
     _mapGrid[x][y] = std::move(grid);
+    _gridPtr[x][y].store(_mapGrid[x][y].get(), std::memory_order_release);
 
     ++_createdGridsCount;
 }
@@ -66,6 +67,7 @@ void MapGridManager::UnloadGrid(uint16 const x, uint16 const y)
         grid->VisitAllCells(visitor);
     }
 
+    _gridPtr[x][y].store(nullptr, std::memory_order_release);
     _mapGrid[x][y] = nullptr;
 }
 
@@ -74,7 +76,7 @@ bool MapGridManager::IsGridCreated(uint16 const x, uint16 const y) const
     if (!MapGridManager::IsValidGridCoordinates(x, y))
         return false;
 
-    return _mapGrid[x][y].get();
+    return _gridPtr[x][y].load(std::memory_order_acquire) != nullptr;
 }
 
 bool MapGridManager::IsGridLoaded(uint16 const x, uint16 const y) const
@@ -82,7 +84,8 @@ bool MapGridManager::IsGridLoaded(uint16 const x, uint16 const y) const
     if (!MapGridManager::IsValidGridCoordinates(x, y))
         return false;
 
-    return _mapGrid[x][y].get() && _mapGrid[x][y]->IsObjectDataLoaded();
+    MapGridType const* grid = _gridPtr[x][y].load(std::memory_order_acquire);
+    return grid && grid->IsObjectDataLoaded();
 }
 
 MapGridType* MapGridManager::GetGrid(uint16 const x, uint16 const y)
@@ -90,7 +93,7 @@ MapGridType* MapGridManager::GetGrid(uint16 const x, uint16 const y)
     if (!MapGridManager::IsValidGridCoordinates(x, y))
         return nullptr;
 
-    return _mapGrid[x][y].get();
+    return _gridPtr[x][y].load(std::memory_order_acquire);
 }
 
 uint32 MapGridManager::GetCreatedGridsCount()
