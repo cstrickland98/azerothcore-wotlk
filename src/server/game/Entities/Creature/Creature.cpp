@@ -364,6 +364,7 @@ void Creature::RemoveFromWorld()
             Acore::Containers::MultimapErasePair(GetMap()->GetCreatureBySpawnIdStore(), m_spawnId, this);
 
         GetMap()->GetObjectsStore().Remove<Creature>(GetGUID());
+        GetMap()->NoteRemovedFromWorldDuringPhase(this);
     }
 }
 

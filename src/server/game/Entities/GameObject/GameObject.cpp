@@ -256,6 +256,7 @@ void GameObject::RemoveFromWorld()
         if (m_spawnId)
             Acore::Containers::MultimapErasePair(GetMap()->GetGameObjectBySpawnIdStore(), m_spawnId, this);
         GetMap()->GetObjectsStore().Remove<GameObject>(GetGUID());
+        GetMap()->NoteRemovedFromWorldDuringPhase(this);
     }
 }
 

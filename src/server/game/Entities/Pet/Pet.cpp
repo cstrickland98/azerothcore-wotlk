@@ -131,6 +131,7 @@ void Pet::RemoveFromWorld()
         Unit::RemoveFromWorld();
         auto storeGuard = GetMap()->LockObjectsStoreForWrite();
         GetMap()->GetObjectsStore().Remove<Creature>(GetGUID());
+        GetMap()->NoteRemovedFromWorldDuringPhase(this);
     }
 }
 

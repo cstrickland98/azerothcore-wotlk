@@ -95,6 +95,7 @@ void DynamicObject::RemoveFromWorld()
 
         auto storeGuard = GetMap()->LockObjectsStoreForWrite();
         GetMap()->GetObjectsStore().Remove<DynamicObject>(GetGUID());
+        GetMap()->NoteRemovedFromWorldDuringPhase(this);
     }
 }
 

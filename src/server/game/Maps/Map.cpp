@@ -184,6 +184,7 @@ template<class T>
 void Map::DeleteFromWorld(T* obj)
 {
     // Note: In case resurrectable corpse and pet its removed from global lists in own destructor
+    ForgetRemovedThisTick(obj);
     delete obj;
 }
 
@@ -700,28 +701,67 @@ void Map::DeferToPhaseEnd(std::function<void()> fn)
         fn();
 }
 
-WorldObject* Map::FindObjectForDeferredOp(ObjectGuid const& guid)
+WorldObject* Map::FindObjectForDeferredOp(ObjectGuid guid)
 {
+    WorldObject* obj = nullptr;
     switch (guid.GetHigh())
     {
         case HighGuid::Player:
-            return ObjectAccessor::GetPlayer(this, guid);
+            obj = ObjectAccessor::GetPlayer(this, guid);
+            break;
         case HighGuid::Unit:
         case HighGuid::Vehicle:
-            return GetCreature(guid);
+            obj = GetCreature(guid);
+            break;
         case HighGuid::Pet:
-            return GetPet(guid);
+            obj = GetPet(guid);
+            break;
         case HighGuid::GameObject:
         case HighGuid::Transport:
         case HighGuid::Mo_Transport:
-            return GetGameObject(guid);
+            obj = GetGameObject(guid);
+            break;
         case HighGuid::DynamicObject:
-            return GetDynamicObject(guid);
+            obj = GetDynamicObject(guid);
+            break;
         case HighGuid::Corpse:
-            return GetCorpse(guid);
+            obj = GetCorpse(guid);
+            break;
         default:
-            return nullptr;
+            break;
     }
+
+    // Only changed in the serial steps, read concurrently by the workers of a phase
+    if (!obj && !_removedThisTick.empty())
+    {
+        auto itr = _removedThisTick.find(guid);
+        if (itr != _removedThisTick.end())
+            obj = itr->second;
+    }
+
+    return obj;
+}
+
+void Map::NoteRemovedFromWorldDuringPhase(WorldObject* obj)
+{
+    if (MapWorkerScratch* scratch = GetPhaseScratch())
+        scratch->removedThisTick.emplace_back(obj->GetGUID(), obj);
+}
+
+void Map::ForgetRemovedThisTick(WorldObject* obj)
+{
+    if (MapWorkerScratch* scratch = GetPhaseScratch())
+    {
+        std::erase_if(scratch->removedThisTick, [obj](std::pair<ObjectGuid, WorldObject*> const& entry) { return entry.second == obj; });
+        return;
+    }
+
+    if (_removedThisTick.empty())
+        return;
+
+    auto itr = _removedThisTick.find(obj->GetGUID());
+    if (itr != _removedThisTick.end() && itr->second == obj)
+        _removedThisTick.erase(itr);
 }
 
 Map::MapGridTask* Map::GetOrCreateGridTask(int32 gridX, int32 gridY)
@@ -945,6 +985,7 @@ void Map::FinishPhase()
         }
 
         i_objectsToRemove.insert(scratch.removeList.begin(), scratch.removeList.end());
+        _removedThisTick.insert(scratch.removedThisTick.begin(), scratch.removedThisTick.end());
         i_objectsForDelayedVisibility.insert(scratch.delayedVisibility.begin(), scratch.delayedVisibility.end());
         AppendTo(_serialDelayedVisibility, scratch.delayedVisibilitySerial);
         AppendTo(_creaturesToMove, scratch.creaturesToMove);
@@ -964,6 +1005,7 @@ void Map::FinishPhase()
 
         scratch.updateObjectLog.clear();
         scratch.removeList.clear();
+        scratch.removedThisTick.clear();
         scratch.delayedVisibility.clear();
         scratch.delayedVisibilitySerial.clear();
         scratch.creaturesToMove.clear();
@@ -1142,6 +1184,9 @@ void Map::UpdateParallel(uint32 t_diff, uint32 s_diff)
             METRIC_TAG("map_id", std::to_string(GetId())),
             METRIC_TAG("map_instanceid", std::to_string(GetInstanceId())));
     }
+
+    // Objects removed from the world during the phases are freed from DelayedUpdate on
+    _removedThisTick.clear();
 
     _threadingStats.serialMs += std::chrono::duration<double, std::milli>(Clock::now() - serialStart).count();
     ++_threadingStats.ticks;
@@ -3908,6 +3953,7 @@ Corpse* Map::ConvertCorpseToBones(ObjectGuid const& ownerGuid, bool insignia /*=
     }
 
     // all references to the corpse should be removed at this point
+    ForgetRemovedThisTick(corpse);
     delete corpse;
 
     return bones;
@@ -3941,6 +3987,7 @@ void Map::RemoveOldCorpses()
     for (Corpse* bones : expiredBones)
     {
         RemoveCorpse(bones);
+        ForgetRemovedThisTick(bones);
         delete bones;
     }
 }
