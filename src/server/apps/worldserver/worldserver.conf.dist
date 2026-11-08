@@ -1339,6 +1339,16 @@ MapUpdateInterval = 10
 MapUpdate.Threads = 1
 
 #
+#    MapUpdate.ThreadsPerMap
+#        Description: Number of threads updating each continent (Eastern Kingdoms, Kalimdor, Outland,
+#                     Northrend and the other non-instanced maps). With more than 1, a continent's grids
+#                     update in four phases of a checkerboard; instances, battlegrounds and arenas keep a
+#                     single thread. Experimental. Takes effect on startup.
+#        Default:     1 - (One thread per map, as MapUpdate.Threads distributes them)
+
+MapUpdate.ThreadsPerMap = 1
+
+#
 #    MoveMaps.Enable
 #        Description: Enable/Disable pathfinding using mmaps - recommended.
 #        Default:     0 - (Disabled)
