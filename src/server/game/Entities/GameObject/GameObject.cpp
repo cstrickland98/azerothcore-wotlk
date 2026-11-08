@@ -175,6 +175,30 @@ void GameObject::CleanupsBeforeDelete(bool /*finalCleanup*/)
         RemoveFromOwner();
 }
 
+// Runs Unit::RemoveGameObject(go, false) of a far owner, in another grid task's area of a parallel map phase, on
+// the owner's task: the serial step at the phase end. The gameobject is resolved again by GUID there; one removed
+// from the world during the phase still resolves, it is only freed after that serial step. The gameobject keeps its
+// owner GUID until then, which also keeps a repeated call (Delete, then RemoveFromWorld) from releasing it twice.
+static void RemoveFromFarOwner(Map* map, Unit* owner, ObjectGuid goGuid, bool fishEscaped)
+{
+    map->RunOnOwner(owner, [goGuid, fishEscaped](WorldObject* target)
+    {
+        Unit* ownerUnit = target->ToUnit();
+        if (!ownerUnit)
+            return;
+
+        WorldObject* object = ownerUnit->GetMap()->FindObjectForDeferredOp(goGuid);
+        if (GameObject* go = object ? object->ToGameObject() : nullptr)
+            ownerUnit->RemoveGameObject(go, false);
+
+        if (fishEscaped && ownerUnit->IsPlayer())
+        {
+            WorldPacket data(SMSG_FISH_ESCAPED, 0);
+            ownerUnit->ToPlayer()->SendDirectMessage(&data);
+        }
+    });
+}
+
 void GameObject::RemoveFromOwner()
 {
     ObjectGuid ownerGUID = GetOwnerGUID();
@@ -183,6 +207,13 @@ void GameObject::RemoveFromOwner()
 
     if (Unit* owner = ObjectAccessor::GetUnit(*this, ownerGUID))
     {
+        Map* map = FindMap();
+        if (map && !map->CanWriteNow(owner))
+        {
+            RemoveFromFarOwner(map, owner, GetGUID(), false);
+            return;
+        }
+
         owner->RemoveGameObject(this, false);
         ASSERT(!GetOwnerGUID());
         return;
@@ -626,6 +657,12 @@ void GameObject::Update(uint32 diff)
                                 return;
                             }
 
+                            // The caster (the channeling owner, or the player who started an unowned ritual) is
+                            // written below: when it is in another grid task's area of a parallel map phase, retry
+                            // on a later update
+                            if (!GetMap()->CanWriteNow(spellCaster))
+                                return;
+
                             uint32 spellId = info->summoningRitual.spellId;
 
                             if (spellId == 62330)                       // GO store nonexistent spell, replace by expected
@@ -710,7 +747,9 @@ void GameObject::Update(uint32 diff)
                             case GAMEOBJECT_TYPE_FISHINGNODE:   //  can't fish now
                                 {
                                     Unit* caster = GetOwner();
-                                    if (caster && caster->IsPlayer())
+                                    if (caster && caster->IsPlayer() && !GetMap()->CanWriteNow(caster))
+                                        RemoveFromFarOwner(GetMap(), caster, GetGUID(), true);
+                                    else if (caster && caster->IsPlayer())
                                     {
                                         caster->ToPlayer()->RemoveGameObject(this, false);
 
