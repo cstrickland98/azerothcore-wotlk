@@ -2280,6 +2280,29 @@ void WorldObject::AddObjectToRemoveList()
 
 TempSummon* Map::SummonCreature(uint32 entry, Position const& pos, SummonPropertiesEntry const* properties /*= nullptr*/, uint32 duration /*= 0*/, WorldObject* summoner /*= nullptr*/, uint32 spellId /*= 0*/, uint32 vehId /*= 0*/, bool visibleBySummonerOnly /*= false*/)
 {
+    // In a parallel phase of the map (MapUpdate.ThreadsPerMap > 1), a summon at a position the running grid task
+    // does not own lands in another task's grid: its AddToMap, AI init and relocation notifier write there. It is
+    // created in the serial step after the phase instead, and the caller gets nullptr now (anything the caller
+    // would have set on the returned summon is skipped). The summoner is resolved again there; a summoner that
+    // left the world meanwhile cancels the summon.
+    if (GetPhaseScratch() && !MapThreading::IsPositionWritable(pos.GetPositionX(), pos.GetPositionY()))
+    {
+        ObjectGuid const summonerGuid = summoner ? summoner->GetGUID() : ObjectGuid::Empty;
+        DeferToPhaseEnd([this, entry, pos = Position(pos), properties, duration, summonerGuid, spellId, vehId, visibleBySummonerOnly]()
+        {
+            WorldObject* deferredSummoner = nullptr;
+            if (summonerGuid)
+            {
+                deferredSummoner = FindObjectForDeferredOp(summonerGuid);
+                if (!deferredSummoner || !deferredSummoner->IsInWorld())
+                    return;
+            }
+
+            SummonCreature(entry, pos, properties, duration, deferredSummoner, spellId, vehId, visibleBySummonerOnly);
+        });
+        return nullptr;
+    }
+
     uint32 mask = UNIT_MASK_SUMMON;
     if (properties)
     {
@@ -2489,6 +2512,22 @@ TempSummon* WorldObject::SummonCreature(uint32 entry, Position const& pos, TempS
 {
     if (Map* map = FindMap())
     {
+        // Far summon in a parallel phase of the map: deferred to the serial step as in Map::SummonCreature, here so
+        // that the despawn type is applied too. The caller gets nullptr now.
+        if (MapThreading::Current().map == map && !MapThreading::IsPositionWritable(pos.GetPositionX(), pos.GetPositionY()))
+        {
+            map->DeferToPhaseEnd([map, entry, pos = Position(pos), spwtype, duration, properties, visibleBySummonerOnly, summonerGuid = GetGUID()]()
+            {
+                WorldObject* summoner = map->FindObjectForDeferredOp(summonerGuid);
+                if (!summoner || !summoner->IsInWorld())
+                    return;
+
+                if (TempSummon* summon = map->SummonCreature(entry, pos, properties, duration, summoner, 0, 0, visibleBySummonerOnly))
+                    summon->SetTempSummonType(spwtype);
+            });
+            return nullptr;
+        }
+
         if (TempSummon* summon = map->SummonCreature(entry, pos, properties, duration, (WorldObject*)this, 0, 0, visibleBySummonerOnly))
         {
             summon->SetTempSummonType(spwtype);
