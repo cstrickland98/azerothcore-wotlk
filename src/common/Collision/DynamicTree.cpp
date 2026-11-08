@@ -116,21 +116,60 @@ DynamicMapTree::~DynamicMapTree()
 
 void DynamicMapTree::insert(GameObjectModel const& mdl)
 {
+    if (_deferWrites.load(std::memory_order_relaxed))
+    {
+        std::lock_guard<std::mutex> guard(_pendingLock);
+        _pending.push_back({ &mdl, true });
+        return;
+    }
+
     impl->insert(mdl);
 }
 
 void DynamicMapTree::remove(GameObjectModel const& mdl)
 {
+    if (_deferWrites.load(std::memory_order_relaxed))
+    {
+        std::lock_guard<std::mutex> guard(_pendingLock);
+        _pending.push_back({ &mdl, false });
+        return;
+    }
+
     impl->remove(mdl);
 }
 
 bool DynamicMapTree::contains(GameObjectModel const& mdl) const
 {
-    return impl->contains(mdl);
+    std::lock_guard<std::mutex> guard(_pendingLock);
+    bool contained = impl->contains(mdl);
+    for (PendingChange const& change : _pending)
+        if (change.model == &mdl)
+            contained = change.insert;
+
+    return contained;
+}
+
+void DynamicMapTree::ApplyPendingChanges()
+{
+    std::vector<PendingChange> pending;
+    {
+        std::lock_guard<std::mutex> guard(_pendingLock);
+        pending.swap(_pending);
+    }
+
+    for (PendingChange const& change : pending)
+    {
+        bool const contained = impl->contains(*change.model);
+        if (change.insert && !contained)
+            impl->insert(*change.model);
+        else if (!change.insert && contained)
+            impl->remove(*change.model);
+    }
 }
 
 void DynamicMapTree::balance()
 {
+    ApplyPendingChanges();
     impl->balance();
 }
 
@@ -141,6 +180,7 @@ int DynamicMapTree::size() const
 
 void DynamicMapTree::update(uint32 t_diff)
 {
+    ApplyPendingChanges();
     impl->update(t_diff);
 }
 

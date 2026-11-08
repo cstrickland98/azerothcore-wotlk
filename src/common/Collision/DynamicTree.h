@@ -20,6 +20,9 @@
 
 #include "Define.h"
 #include "Optional.h"
+#include <atomic>
+#include <mutex>
+#include <vector>
 
 namespace G3D
 {
@@ -38,7 +41,18 @@ struct DynTreeImpl;
 
 class DynamicMapTree
 {
+    struct PendingChange
+    {
+        GameObjectModel const* model;
+        bool insert;
+    };
+
     DynTreeImpl* impl;
+    std::atomic<bool> _deferWrites{false};
+    mutable std::mutex _pendingLock;
+    std::vector<PendingChange> _pending;
+
+    void ApplyPendingChanges();
 
 public:
     DynamicMapTree();
@@ -60,6 +74,9 @@ public:
     void remove(GameObjectModel const&);
     [[nodiscard]] bool contains(GameObjectModel const&) const;
     [[nodiscard]] int size() const;
+
+    // While set, insert / remove are queued and applied by the next balance(); queries stay read-only
+    void SetDeferWrites(bool defer) { _deferWrites.store(defer, std::memory_order_relaxed); }
 
     void balance();
     void update(uint32 diff);
