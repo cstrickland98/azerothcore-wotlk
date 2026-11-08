@@ -279,8 +279,21 @@ Unit* CombatManager::GetAnyTarget() const
 
 bool CombatManager::SetInCombatWith(Unit* who, bool addSecondUnitSuppressed)
 {
-    // a combat reference writes both units: with a unit outside the running task's area it is made on that unit's owner
-    if (Map* map = _owner->FindMap(); map && !map->CanWriteNow(who))
+    Map* map = _owner->FindMap();
+    // a combat reference writes both units: with this unit outside the running task's area (the original caster
+    // of a proc, a far master) it is made on this unit's owner, with who outside it on who's owner
+    if (map && !map->CanWriteNow(_owner))
+    {
+        map->RunOnOwner(_owner, [whoGuid = who->GetGUID(), addSecondUnitSuppressed](WorldObject* target)
+        {
+            Unit* owner = target->ToUnit();
+            Unit* whoUnit = ObjectAccessor::GetUnit(*target, whoGuid);
+            if (owner && whoUnit)
+                owner->GetCombatManager().SetInCombatWith(whoUnit, addSecondUnitSuppressed);
+        });
+        return IsInCombatWith(who);
+    }
+    if (map && !map->CanWriteNow(who))
     {
         map->RunOnOwner(who, [ownerGuid = _owner->GetGUID(), addSecondUnitSuppressed](WorldObject* target)
         {
