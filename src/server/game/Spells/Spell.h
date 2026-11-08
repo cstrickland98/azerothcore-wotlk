@@ -755,6 +755,7 @@ public:
     void DoAllEffectOnTarget(GOTargetInfo* target);
     void DoAllEffectOnTarget(ItemTargetInfo* target);
     bool UpdateChanneledTargetList();
+    void RemoveChannelTargetAura(Unit* unit, AuraApplication* aurApp);
     bool IsValidDeadOrAliveTarget(Unit const* target) const;
     void HandleLaunchPhase();
     void DoAllEffectOnLaunchTarget(TargetInfo& targetInfo, float* multiplier);
