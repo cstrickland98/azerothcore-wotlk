@@ -17,6 +17,9 @@
 
 #include "MapWorkerPool.h"
 #include "DatabaseEnv.h"
+#include "Log.h"
+#include "MapThreading.h"
+#include <exception>
 
 MapWorkerPool::MapWorkerPool(uint32 helperThreads) : _job(nullptr), _generation(0), _running(0), _stop(false)
 {
@@ -56,11 +59,25 @@ void MapWorkerPool::Run(std::function<void(uint32)> const& job)
 
     _wake.notify_all();
 
-    job(0);
+    // The helpers reference job until they are done: wait for them even when worker 0 throws
+    std::exception_ptr error;
+    try
+    {
+        job(0);
+    }
+    catch (...)
+    {
+        error = std::current_exception();
+    }
 
-    std::unique_lock<std::mutex> guard(_lock);
-    _done.wait(guard, [this] { return _running == 0; });
-    _job = nullptr;
+    {
+        std::unique_lock<std::mutex> guard(_lock);
+        _done.wait(guard, [this] { return _running == 0; });
+        _job = nullptr;
+    }
+
+    if (error)
+        std::rethrow_exception(error);
 }
 
 void MapWorkerPool::WorkerMain(uint32 workerIndex)
@@ -86,7 +103,20 @@ void MapWorkerPool::WorkerMain(uint32 workerIndex)
             job = _job;
         }
 
-        (*job)(workerIndex);
+        try
+        {
+            (*job)(workerIndex);
+        }
+        catch (std::exception const& e)
+        {
+            LOG_ERROR("maps.threading", "Map worker {}: exception in a parallel phase: {}", workerIndex, e.what());
+            MapThreading::Current() = MapThreading::Context();
+        }
+        catch (...)
+        {
+            LOG_ERROR("maps.threading", "Map worker {}: unknown exception in a parallel phase", workerIndex);
+            MapThreading::Current() = MapThreading::Context();
+        }
 
         bool last = false;
         {
