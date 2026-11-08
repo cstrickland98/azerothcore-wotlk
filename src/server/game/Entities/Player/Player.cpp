@@ -9360,6 +9360,20 @@ void Player::RemovePet(Pet* pet, PetSaveMode mode, bool returnreagent)
         LOG_DEBUG("entities.pet", "RemovePet {}, {}, {}", pet->GetEntry(), mode, returnreagent);
         if (pet->m_removed)
             return;
+
+        // A pet left far behind sits in a grid another map task owns and updates right now: removing it writes the pet
+        // and this owner, so the whole removal runs in the phase's serial step, where both are writable. Both outlive
+        // the tick (objects removed during a tick are freed after it, players only at logout).
+        if (Map* map = pet->FindMap(); map && map->IsParallelPhase() && !map->CanWriteNow(pet))
+        {
+            map->DeferToPhaseEnd([map, owner = this, petGuid = pet->GetGUID(), mode, returnreagent]()
+            {
+                WorldObject* obj = map->FindObjectForDeferredOp(petGuid);
+                if (Creature* creature = obj ? obj->ToCreature() : nullptr; creature && creature->IsPet())
+                    owner->RemovePet(static_cast<Pet*>(creature), mode, returnreagent);
+            });
+            return;
+        }
     }
 
     if (returnreagent && (pet || (m_temporaryUnsummonedPetNumber && (!m_session || !m_session->PlayerLogout()))) && !InBattleground())

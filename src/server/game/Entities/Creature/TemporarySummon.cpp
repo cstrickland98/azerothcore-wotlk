@@ -329,7 +329,8 @@ void TempSummon::UnSummon(Milliseconds msTime)
     if (IsPet())
     {
         ToPet()->Remove(PET_SAVE_NOT_IN_SLOT);
-        ASSERT(!IsInWorld());
+        // still in the world only when another map task owns the pet and the removal waits for the serial step
+        ASSERT(!IsInWorld() || (FindMap() && FindMap()->IsParallelPhase()));
         return;
     }
 

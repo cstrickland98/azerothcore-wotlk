@@ -955,6 +955,9 @@ HappinessState Pet::GetHappinessState()
 
 void Pet::Remove(PetSaveMode mode, bool returnreagent)
 {
+    if (m_removed)
+        return;
+
     if (Player* owner = GetOwner())
     {
         owner->RemovePet(this, mode, returnreagent);
