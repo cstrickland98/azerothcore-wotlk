@@ -27,6 +27,7 @@
 #include "Guild.h"
 #include "InstanceScript.h"
 #include "Language.h"
+#include "Map.h"
 #include "OutdoorPvPMgr.h"
 #include "Pet.h"
 #include "Player.h"
@@ -1584,6 +1585,25 @@ void Player::UpdateFFAPvPState(bool reset /*= true*/)
                     sWorld->getIntConfig(CONFIG_FFA_PVP_TIMER);
             }
         }
+    }
+}
+
+void Player::SetPvP(bool state)
+{
+    Unit::SetPvP(state);
+
+    Map* map = FindMap();
+    for (Unit* controlled : m_Controlled)
+    {
+        // a controlled unit can be far, in another task's area
+        if (!map || map->CanWriteNow(controlled))
+            controlled->SetPvP(state);
+        else
+            map->RunOnOwner(controlled, [state](WorldObject* target)
+            {
+                if (Unit* unit = target->ToUnit())
+                    unit->SetPvP(state);
+            });
     }
 }
 
