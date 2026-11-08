@@ -1275,6 +1275,17 @@ bool PoolMgr::CheckPool(uint32 pool_id) const
 template<typename T>
 void PoolMgr::UpdatePool(SpawnedPoolData& spawnedPoolData, uint32 pool_id, uint32 db_guid_or_pool_id)
 {
+    // A pool update spawns / despawns members anywhere on the map: run it in the serial step after the phase.
+    // Only a worker of this map's phase defers (DeferToPhaseEnd runs fn at once on any other thread).
+    if (Map* map = spawnedPoolData.GetMap(); map && map->IsParallelPhase() && MapThreading::Current().map == map)
+    {
+        map->DeferToPhaseEnd([map, pool_id, db_guid_or_pool_id]()
+        {
+            sPoolMgr->UpdatePool<T>(map->GetPoolData(), pool_id, db_guid_or_pool_id);
+        });
+        return;
+    }
+
     std::lock_guard<std::recursive_mutex> guard(spawnedPoolData.GetLock());
     if (uint32 motherpoolid = IsPartOfAPool<Pool>(pool_id))
         SpawnPool<Pool>(spawnedPoolData, motherpoolid, pool_id);
