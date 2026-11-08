@@ -26,7 +26,9 @@
 #include "InstanceSaveMgr.h"
 #include "Log.h"
 #include "MapMgr.h"
+#include "MapThreading.h"
 #include "MathUtil.h"
+#include "ObjectAccessor.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
 #include "Pet.h"
@@ -291,6 +293,36 @@ void WorldSession::HandleMoveWorldportAck()
 
 void WorldSession::HandleMoveTeleportAck(WorldPacket& recvData)
 {
+    // In a parallel phase a near teleport out of the running task's reach would move the player into grids
+    // another task can be writing: handle the ack in the serial step after the phase
+    if (Player* mover = _player->m_mover->ToPlayer())
+    {
+        Map* map = mover->FindMap();
+        if (map && map->IsParallelPhase() && MapThreading::Current().map == map && mover->IsBeingTeleportedNear())
+        {
+            WorldLocation const& dest = mover->GetTeleportDest();
+            if (!MapThreading::IsPositionWritable(dest.GetPositionX(), dest.GetPositionY()))
+            {
+                ObjectGuid const playerGuid = _player->GetGUID();
+                map->DeferToPhaseEnd([map, playerGuid, packet = WorldPacket(recvData)]() mutable
+                {
+                    Player* player = ObjectAccessor::FindPlayer(playerGuid);
+                    if (!player || player->FindMap() != map)
+                        return;
+
+                    Player* deferredMover = player->m_mover->ToPlayer();
+                    if (!deferredMover || !deferredMover->IsBeingTeleportedNear())
+                        return;
+
+                    player->GetSession()->HandleMoveTeleportAck(packet);
+                });
+
+                recvData.rfinish();
+                return;
+            }
+        }
+    }
+
     LOG_DEBUG("network", "MSG_MOVE_TELEPORT_ACK");
 
     ObjectGuid guid;

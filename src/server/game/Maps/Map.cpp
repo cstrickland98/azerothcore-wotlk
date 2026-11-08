@@ -3411,6 +3411,13 @@ bool Map::SpawnGroupSpawn(uint32 groupId, bool ignoreRespawn /*= false*/, bool f
         return false;
     }
 
+    // The group's spawns can lie anywhere on the map: from a grid task they are added after the phase
+    if (GetPhaseScratch())
+    {
+        DeferToPhaseEnd([this, groupId, ignoreRespawn, force]() { SpawnGroupSpawn(groupId, ignoreRespawn, force); });
+        return true;
+    }
+
     // Mark group as active on this map (toggle to active state)
     {
         std::lock_guard<std::mutex> guard(_respawnLock);
@@ -3504,6 +3511,13 @@ bool Map::SpawnGroupDespawn(uint32 groupId, bool deleteRespawnTimes /*= false*/)
         LOG_ERROR("maps", "Tried to despawn group {} on map {}, but group has map {}. Blocked.",
             groupId, GetId(), groupData->mapId);
         return false;
+    }
+
+    // The group's spawns can lie anywhere on the map: from a grid task they are removed after the phase
+    if (GetPhaseScratch())
+    {
+        DeferToPhaseEnd([this, groupId, deleteRespawnTimes]() { SpawnGroupDespawn(groupId, deleteRespawnTimes); });
+        return true;
     }
 
     // Mark group as inactive on this map (toggle to inactive state)
@@ -3894,6 +3908,14 @@ Corpse* Map::ConvertCorpseToBones(ObjectGuid const& ownerGuid, bool insignia /*=
     Corpse* corpse = GetCorpseByPlayer(ownerGuid);
     if (!corpse)
         return nullptr;
+
+    // From a grid task, a corpse the task does not own is converted in the serial step after the phase; the
+    // caller sees no bones then
+    if (GetPhaseScratch() && !MapThreading::IsPositionWritable(corpse->GetPositionX(), corpse->GetPositionY()))
+    {
+        DeferToPhaseEnd([this, ownerGuid, insignia]() { ConvertCorpseToBones(ownerGuid, insignia); });
+        return nullptr;
+    }
 
     RemoveCorpse(corpse);
 
