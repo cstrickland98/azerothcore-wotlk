@@ -40,6 +40,7 @@
 #include "Timer.h"
 #include "GridTerrainData.h"
 #include "MapThreading.h"
+#include "SpinLock.h"
 #include <array>
 #include <atomic>
 #include <bitset>
@@ -617,12 +618,18 @@ public:
         return GetGuidSequenceGenerator<high>().Generate();
     }
 
+    // Outside this map's phases the set is written directly, also by other maps' threads (a group or guild
+    // member, an item owner on another map): _updateObjectsLock keeps the set itself intact, FinishPhase and
+    // SendObjectUpdates take it too
     void AddUpdateObject(Object* obj)
     {
         if (MapWorkerScratch* scratch = GetPhaseScratch())
             scratch->updateObjectLog.emplace_back(obj, true);
         else
+        {
+            std::lock_guard<Acore::SpinLock> guard(_updateObjectsLock);
             _updateObjects.insert(obj);
+        }
     }
 
     void RemoveUpdateObject(Object* obj)
@@ -630,7 +637,10 @@ public:
         if (MapWorkerScratch* scratch = GetPhaseScratch())
             scratch->updateObjectLog.emplace_back(obj, false);
         else
+        {
+            std::lock_guard<Acore::SpinLock> guard(_updateObjectsLock);
             _updateObjects.erase(obj);
+        }
     }
 
     size_t GetUpdatableObjectsCount() const { return _updatableObjectList.size(); }
@@ -836,7 +846,8 @@ private:
     std::unordered_map<ObjectGuid, Corpse*> _corpsesByPlayer;
     std::unordered_set<Corpse*> _corpseBones;
 
-    std::unordered_set<Object*> _updateObjects;
+    std::unordered_set<Object*> _updateObjects;             // guarded by _updateObjectsLock outside phases
+    mutable Acore::SpinLock _updateObjectsLock;
 
     UpdatableObjectList _updatableObjectList;
     PendingAddUpdatableObjectList _pendingAddUpdatableObjectList;

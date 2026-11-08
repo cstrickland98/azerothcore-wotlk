@@ -19,6 +19,7 @@
 #define _OBJECTVISIBILITYCONTAINER_H
 
 #include "Common.h"
+#include "Errors.h"
 #include "ObjectGuid.h"
 #include "SpinLock.h"
 #include <memory>
@@ -75,6 +76,8 @@ public:
         std::vector<Player*>& players = scratch.Get();
         {
             std::lock_guard<Acore::SpinLock> guard(_lock);
+            // a corrupted map would be iterated forever here, allocating until memory runs out
+            ASSERT(_visiblePlayersMap.size() < 1000000, "ObjectVisibilityContainer: %zu visible players", _visiblePlayersMap.size());
             players.reserve(_visiblePlayersMap.size());
             for (auto const& kvPair : _visiblePlayersMap)
                 players.push_back(kvPair.second);
@@ -96,6 +99,7 @@ public:
             if (!_visibleWorldObjectsMap)
                 return;
 
+            ASSERT(_visibleWorldObjectsMap->size() < 1000000, "ObjectVisibilityContainer: %zu visible objects", _visibleWorldObjectsMap->size());
             worldObjects.reserve(_visibleWorldObjectsMap->size());
             for (auto const& kvPair : *_visibleWorldObjectsMap)
                 worldObjects.push_back(kvPair.second);

@@ -976,12 +976,15 @@ void Map::FinishPhase()
     for (MapWorkerScratch& scratch : _scratch)
     {
         // Replayed in call order without dereferencing: a removed object may be freed already
-        for (auto const& [obj, added] : scratch.updateObjectLog)
         {
-            if (added)
-                _updateObjects.insert(obj);
-            else
-                _updateObjects.erase(obj);
+            std::lock_guard<Acore::SpinLock> guard(_updateObjectsLock);
+            for (auto const& [obj, added] : scratch.updateObjectLog)
+            {
+                if (added)
+                    _updateObjects.insert(obj);
+                else
+                    _updateObjects.erase(obj);
+            }
         }
 
         i_objectsToRemove.insert(scratch.removeList.begin(), scratch.removeList.end());
@@ -2449,12 +2452,29 @@ void Map::SendObjectUpdates()
 {
     UpdateDataMapType update_players;
 
-    while (!_updateObjects.empty())
+    // BuildUpdate adds nothing (the object's update flag is still set), so the loop ends after about the objects
+    // present at entry; a runaway here (a corrupted set, an object re-adding itself) grows update_players until
+    // memory is exhausted minutes later, so it is stopped with a usable crash report instead
+    size_t processed = 0;
+    size_t limit = 0;
+    while (true)
     {
-        Object* obj = *_updateObjects.begin();
-        ASSERT(obj->IsInWorld());
+        Object* obj = nullptr;
+        {
+            std::lock_guard<Acore::SpinLock> guard(_updateObjectsLock);
+            if (_updateObjects.empty())
+                break;
 
-        _updateObjects.erase(_updateObjects.begin());
+            if (!limit)
+                limit = _updateObjects.size() * 2 + 10000;
+
+            obj = *_updateObjects.begin();
+            _updateObjects.erase(_updateObjects.begin());
+        }
+
+        ASSERT(obj->IsInWorld());
+        ASSERT(++processed <= limit, "Map::SendObjectUpdates runaway on map %u: %zu objects processed, last %s",
+            GetId(), processed, obj->GetGUID().ToString().c_str());
         obj->BuildUpdate(update_players);
     }
 
