@@ -1418,7 +1418,7 @@ void Aura::UnregisterSingleTarget()
         LOG_ERROR("spells", "Aura::UnregisterSingleTarget: No caster was found."); //ASSERT(caster);
     }
     else
-        caster->GetSingleCastAuras().remove(this);
+        caster->RemoveSingleCastAura(this);
 
     SetIsSingleTarget(false);
 }

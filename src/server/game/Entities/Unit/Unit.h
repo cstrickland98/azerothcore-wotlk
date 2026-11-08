@@ -33,6 +33,7 @@
 #include "SpinLock.h"
 #include "UnitUtils.h"
 #include <array>
+#include <atomic>
 #include <boost/container/flat_map.hpp>
 #include <functional>
 #include <mutex>
@@ -1043,17 +1044,18 @@ public:
     void AddExtraAttacks(uint32 count);
 
     // Combot points system
-    [[nodiscard]] uint8 GetComboPoints(Unit const* who = nullptr) const { return (who && m_comboTarget != who) ? 0 : m_comboPoints; }
-    [[nodiscard]] uint8 GetComboPoints(ObjectGuid const& guid) const { return (m_comboTarget && m_comboTarget->GetGUID() == guid) ? m_comboPoints : 0; }
-    [[nodiscard]] Unit* GetComboTarget() const { return m_comboTarget; }
-    [[nodiscard]] ObjectGuid const GetComboTargetGUID() const { return m_comboTarget ? m_comboTarget->GetGUID() : ObjectGuid::Empty; }
+    [[nodiscard]] uint8 GetComboPoints(Unit const* who = nullptr) const { return (who && GetComboTarget() != who) ? 0 : m_comboPoints; }
+    [[nodiscard]] uint8 GetComboPoints(ObjectGuid const& guid) const { return (!m_comboTargetGuid.IsEmpty() && m_comboTargetGuid == guid) ? m_comboPoints : 0; }
+    [[nodiscard]] Unit* GetComboTarget() const { return m_comboTarget.load(std::memory_order_relaxed); }
+    [[nodiscard]] ObjectGuid const GetComboTargetGUID() const { return m_comboTargetGuid; }
 
     void AddComboPoints(Unit* target, int8 count);
     void AddComboPoints(int8 count) { AddComboPoints(nullptr, count); }
     void ClearComboPoints();
 
-    void AddComboPointHolder(Unit* unit) { m_ComboPointHolders.insert(unit); }
-    void RemoveComboPointHolder(Unit* unit) { m_ComboPointHolders.erase(unit); }
+    // A holder's task adds and removes itself, which with intra-map threading may not be ours: the set is locked
+    void AddComboPointHolder(Unit* unit) { std::lock_guard<Acore::SpinLock> guard(_comboPointHoldersLock); m_ComboPointHolders.insert(unit); }
+    void RemoveComboPointHolder(Unit* unit) { std::lock_guard<Acore::SpinLock> guard(_comboPointHoldersLock); m_ComboPointHolders.erase(unit); }
     void ClearComboPointHolders();
 
     // PvP
@@ -1464,8 +1466,15 @@ public:
     void _ApplyAllAuraStatMods();
 
     [[nodiscard]] AuraEffectList const& GetAuraEffectsByType(AuraType type) const { return m_modAuras[type]; }
-    AuraList&       GetSingleCastAuras()       { return m_scAuras; }
-    [[nodiscard]] AuraList const& GetSingleCastAuras() const { return m_scAuras; }
+    // Single-target auras cast by this unit on other units. A target's task unregisters them (expiry, dispel, death of
+    // the target), which with intra-map threading may not be ours, so the list is locked: use these helpers.
+    void AddSingleCastAura(Aura* aura) { std::lock_guard<Acore::SpinLock> guard(_scAurasLock); m_scAuras.push_back(aura); }
+    void RemoveSingleCastAura(Aura* aura) { std::lock_guard<Acore::SpinLock> guard(_scAurasLock); m_scAuras.remove(aura); }
+    [[nodiscard]] AuraList CopySingleCastAuras() const { std::lock_guard<Acore::SpinLock> guard(_scAurasLock); return m_scAuras; }
+    // Removes every single-target aura of ours that is still registered and matches pred (called under the list lock:
+    // it may only read the aura and must not call into other objects). An aura on a unit outside the running task's
+    // area is removed on that unit's owner.
+    void RemoveSingleCastAurasIf(std::function<bool(Aura const*)> const& pred);
 
     [[nodiscard]] AuraEffect* GetAuraEffect(uint32 spellId, uint8 effIndex, ObjectGuid casterGUID = ObjectGuid::Empty) const;
     [[nodiscard]] AuraEffect* GetAuraEffectOfRankedSpell(uint32 spellId, uint8 effIndex, ObjectGuid casterGUID = ObjectGuid::Empty) const;
@@ -2177,6 +2186,10 @@ protected:
     void _UpdateSpells(uint32 time);
     void _DeleteRemovedAuras();
 
+    // Unlocked raw access, kept only for Player::ActivateSpec until it moves to RemoveSingleCastAurasIf: other
+    // units' tasks unregister from this list under _scAurasLock
+    AuraList& GetSingleCastAuras() { return m_scAuras; }
+
     void _UpdateAutoRepeatSpell();
 
     bool CanSparringWith(Unit const* attacker) const;   ///@brief: Check if unit is eligible for sparring damages. Work only if attacker and victim are creatures.
@@ -2233,7 +2246,8 @@ protected:
     uint32 m_removedAurasCount;
 
     AuraEffectList m_modAuras[TOTAL_AURAS];
-    AuraList m_scAuras;                        // casted singlecast auras
+    AuraList m_scAuras;                        // casted singlecast auras, guarded by _scAurasLock
+    mutable Acore::SpinLock _scAurasLock;
     AuraApplicationList m_interruptableAuras;  // auras which have interrupt mask applied on unit
     AuraStateAurasMap m_auraStateAuras;        // Used for improve performance of aura state checks on aura apply/remove
     uint32 m_interruptMask;
@@ -2311,9 +2325,16 @@ private:
     std::unordered_set<AbstractFollower*> m_followingMe;    // guarded by _followersLock
     mutable Acore::SpinLock _followersLock;
 
-    Unit* m_comboTarget;
+    // m_comboTarget is atomic: a far target leaving the world detaches its holders (ClearComboPointHolders) so they
+    // stop pointing at it; m_comboTargetGuid keeps the target's GUID until the holder clears its combo points
+    std::atomic<Unit*> m_comboTarget;
+    ObjectGuid m_comboTargetGuid;
     int8 m_comboPoints;
-    std::unordered_set<Unit*> m_ComboPointHolders;
+    std::unordered_set<Unit*> m_ComboPointHolders;          // guarded by _comboPointHoldersLock
+    mutable Acore::SpinLock _comboPointHoldersLock;
+
+    // Clears our combo points if they are still on the unit with this GUID (deferred ClearComboPointHolders)
+    void ClearComboPointsOf(ObjectGuid targetGuid);
 
     bool m_cleanupDone; // lock made to not add stuff after cleanup before delete
     bool m_duringRemoveFromWorld; // lock made to not add stuff after begining removing from world

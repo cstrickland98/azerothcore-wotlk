@@ -498,7 +498,17 @@ Unit::~Unit()
         do
         {
             Player* p = *(m_sharedVision.begin());
-            p->m_isInSharedVisionOf.erase(this);
+            // the player can be far, in another task's area: its set is written on its owner, with this unit as a
+            // key only (never dereferenced: it is gone by then)
+            Map* playerMap = p->FindMap();
+            if (!playerMap || playerMap->CanWriteNow(p))
+                p->m_isInSharedVisionOf.erase(this);
+            else
+                playerMap->RunOnOwner(p, [unitKey = this](WorldObject* target)
+                {
+                    if (Player* player = target->ToPlayer())
+                        player->m_isInSharedVisionOf.erase(unitKey);
+                });
             m_sharedVision.remove(p);
         } while (!m_sharedVision.empty());
     }
@@ -4625,20 +4635,12 @@ void Unit::_AddAura(UnitAura* aura, Unit* caster)
          */
 
         // register single target aura
-        caster->GetSingleCastAuras().push_back(aura);
+        caster->AddSingleCastAura(aura);
         // remove other single target auras
-        Unit::AuraList& scAuras = caster->GetSingleCastAuras();
-        for (Unit::AuraList::iterator itr = scAuras.begin(); itr != scAuras.end();)
+        caster->RemoveSingleCastAurasIf([aura](Aura const* other)
         {
-            if ((*itr) != aura &&
-                    (*itr)->IsSingleTargetWith(aura))
-            {
-                (*itr)->Remove();
-                itr = scAuras.begin();
-            }
-            else
-                ++itr;
-        }
+            return other != aura && other->IsSingleTargetWith(aura);
+        });
     }
 }
 
@@ -5254,7 +5256,7 @@ void Unit::RemoveAurasDueToSpellBySteal(uint32 spellId, ObjectGuid casterGUID, U
                             newAura->UnregisterSingleTarget();
                             // bring back single target aura status to the old aura
                             aura->SetIsSingleTarget(true);
-                            caster->GetSingleCastAuras().push_back(aura);
+                            caster->AddSingleCastAura(aura);
                         }
                         // FIXME: using aura->GetMaxDuration() maybe not blizzlike but it fixes stealing of spells like Innervate
                         // Keep the original caster's amounts: recalculating them with the stealer as caster would apply
@@ -5366,17 +5368,51 @@ void Unit::RemoveNotOwnSingleTargetAuras()
     }
 
     // single target auras at other targets
-    AuraList& scAuras = GetSingleCastAuras();
-    for (AuraList::iterator iter = scAuras.begin(); iter != scAuras.end();)
+    RemoveSingleCastAurasIf([this](Aura const* aura) { return aura->GetUnitOwner() != this; });
+}
+
+void Unit::RemoveSingleCastAurasIf(std::function<bool(Aura const*)> const& pred)
+{
+    // Walk a copy: a removal unregisters the aura (and maybe others) from the list. An entry is only known to be alive
+    // while it is registered (its owner's task unregisters it under the lock before deleting it), so each one is
+    // checked again under the lock, and a far owner's aura is resolved again there by spell and caster.
+    Map* map = FindMap();
+    for (Aura* aura : CopySingleCastAuras())
     {
-        Aura* aura = *iter;
-        if (aura->GetUnitOwner() != this)
+        bool ownerWritable = true;
+        ObjectGuid ownerGuid;
+        uint32 spellId = 0;
+        {
+            std::lock_guard<Acore::SpinLock> guard(_scAurasLock);
+            if (std::find(m_scAuras.begin(), m_scAuras.end(), aura) == m_scAuras.end() || !pred(aura))
+                continue;
+
+            Unit* owner = aura->GetUnitOwner();
+            if (map && !map->CanWriteNow(owner))
+            {
+                ownerWritable = false;
+                ownerGuid = owner->GetGUID();
+                spellId = aura->GetId();
+            }
+        }
+
+        // a writable owner is updated by no other task: the aura stays alive until we remove it
+        if (ownerWritable)
         {
             aura->Remove();
-            iter = scAuras.begin();
+            continue;
         }
-        else
-            ++iter;
+
+        map->RunOnOwner(ownerGuid, [spellId, casterGuid = GetGUID()](WorldObject* target)
+        {
+            Unit* owner = target->ToUnit();
+            if (!owner)
+                return;
+
+            if (Aura* ownedAura = owner->GetOwnedAura(spellId, casterGuid))
+                if (ownedAura->IsSingleTarget())
+                    ownedAura->Remove();
+        });
     }
 }
 
@@ -8333,6 +8369,8 @@ Unit* Unit::GetNextRandomRaidMemberOrPet(float radius)
     // reserve place for players and pets because resizing vector every unit push is unefficient (vector is reallocated then)
     nearMembers.reserve(group->GetMembersCount() * 2);
 
+    // other maps' threads and tasks change the member list
+    std::lock_guard<std::recursive_mutex> groupGuard(group->GetLock());
     for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
         if (Player* Target = itr->GetSource())
         {
@@ -11623,7 +11661,9 @@ Unit* Creature::SelectVictim()
             {
                 if (owner->IsInCombat())
                     target = owner->getAttackerForHelper();
-                if (!target)
+                // the owner's controlled set is written by the owner's task: a far owner's (another task's area) is
+                // not walked
+                if (!target && GetMap()->CanWriteNow(owner))
                     for (ControlSet::const_iterator itr = owner->m_Controlled.begin(); itr != owner->m_Controlled.end(); ++itr)
                         if ((*itr)->IsInCombat())
                         {
@@ -13213,14 +13253,17 @@ void Unit::AddComboPoints(Unit* target, int8 count)
         return;
     }
 
-    if (target && target != m_comboTarget)
+    Unit* comboTarget = GetComboTarget();
+    if (target && target != comboTarget)
     {
-        if (m_comboTarget)
+        // the old target can be far, in another task's area: its holder set is locked
+        if (comboTarget)
         {
-            m_comboTarget->RemoveComboPointHolder(this);
+            comboTarget->RemoveComboPointHolder(this);
         }
 
-        m_comboTarget = target;
+        m_comboTarget.store(target, std::memory_order_relaxed);
+        m_comboTargetGuid = target->GetGUID();
         m_comboPoints = count;
         target->AddComboPointHolder(this);
     }
@@ -13234,7 +13277,8 @@ void Unit::AddComboPoints(Unit* target, int8 count)
 
 void Unit::ClearComboPoints()
 {
-    if (!m_comboTarget)
+    // m_comboTarget is null with a GUID set when a far target left the world and detached us (ClearComboPointHolders)
+    if (m_comboTargetGuid.IsEmpty())
     {
         return;
     }
@@ -13245,8 +13289,21 @@ void Unit::ClearComboPoints()
 
     m_comboPoints = 0;
     SendComboPoints();
-    m_comboTarget->RemoveComboPointHolder(this);
-    m_comboTarget = nullptr;
+    if (Unit* comboTarget = GetComboTarget())
+    {
+        comboTarget->RemoveComboPointHolder(this);
+    }
+
+    m_comboTarget.store(nullptr, std::memory_order_relaxed);
+    m_comboTargetGuid.Clear();
+}
+
+void Unit::ClearComboPointsOf(ObjectGuid targetGuid)
+{
+    if (m_comboTargetGuid == targetGuid)
+    {
+        ClearComboPoints();
+    }
 }
 
 void Unit::SendComboPoints()
@@ -13256,7 +13313,7 @@ void Unit::SendComboPoints()
         return;
     }
 
-    PackedGuid const packGUID = m_comboTarget ? m_comboTarget->GetPackGUID() : PackedGuid();
+    PackedGuid const packGUID = !m_comboTargetGuid.IsEmpty() ? PackedGuid(m_comboTargetGuid) : PackedGuid();
     if (Player* playerMe = ToPlayer())
     {
         WorldPacket data(SMSG_UPDATE_COMBO_POINTS, packGUID.size() + 1);
@@ -13289,9 +13346,48 @@ void Unit::SendComboPoints()
 
 void Unit::ClearComboPointHolders()
 {
-    while (!m_ComboPointHolders.empty())
+    // Holders are other units; with intra-map threading a holder can be far, in another task's area, adding and
+    // removing itself meanwhile. The set is taken out under the lock, where every holder is alive (a holder removes
+    // itself under the lock before it is deleted): near holders clear their combo points now, far ones are detached
+    // (their target pointer is reset, so they no longer touch us) and clear them on their owner.
+    Map* map = FindMap();
+    ObjectGuid const targetGuid = GetGUID();
+    std::vector<Unit*> nearHolders;
+    std::vector<ObjectGuid> farHolders;
+    while (true)
     {
-        (*m_ComboPointHolders.begin())->ClearComboPoints(); // this also removes it from m_comboPointHolders
+        {
+            std::lock_guard<Acore::SpinLock> guard(_comboPointHoldersLock);
+            if (m_ComboPointHolders.empty())
+                break;
+
+            for (Unit* holder : m_ComboPointHolders)
+            {
+                if (!map || map->CanWriteNow(holder))
+                    nearHolders.push_back(holder);
+                else
+                {
+                    Unit* expected = this;
+                    holder->m_comboTarget.compare_exchange_strong(expected, nullptr, std::memory_order_relaxed);
+                    farHolders.push_back(holder->GetGUID());
+                }
+            }
+
+            m_ComboPointHolders.clear();
+        }
+
+        for (Unit* holder : nearHolders)
+            holder->ClearComboPoints(); // also removes it from m_ComboPointHolders (no longer there)
+
+        for (ObjectGuid const& holderGuid : farHolders)
+            map->RunOnOwner(holderGuid, [targetGuid](WorldObject* target)
+            {
+                if (Unit* holder = target->ToUnit())
+                    holder->ClearComboPointsOf(targetGuid);
+            });
+
+        nearHolders.clear();
+        farHolders.clear();
     }
 }
 
@@ -13856,6 +13952,8 @@ bool Unit::HandleAuraRaidProcFromChargeWithValue(AuraEffect* triggeredByAura)
                 }
                 else
                 {
+                    // other maps' threads and tasks change the member list
+                    std::lock_guard<std::recursive_mutex> groupGuard(group->GetLock());
                     for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
                         if (Player* Target = itr->GetSource())
                         {
@@ -14049,6 +14147,9 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
         if (lr && lr->IsInMap(creature))
             player = creature->GetLootRecipient();
         else if (Group* lrg = creature->GetLootRecipientGroup())
+        {
+            // other maps' threads and tasks change the member list
+            std::lock_guard<std::recursive_mutex> groupGuard(lrg->GetLock());
             for (GroupReference* itr = lrg->GetFirstMember(); itr != nullptr; itr = itr->next())
                 if (Player* member = itr->GetSource())
                     if (member->IsAtLootRewardDistance(creature))
@@ -14056,6 +14157,7 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
                         player = member;
                         break;
                     }
+        }
     }
 
     // Exploit fix
@@ -14291,14 +14393,32 @@ void Unit::Kill(Unit* killer, Unit* victim, bool durabilityLoss, WeaponAttackTyp
         {
             if (WorldObject* summoner = summon->GetSummoner())
             {
-                if (summoner->ToCreature() && summoner->ToCreature()->IsAIEnabled)
+                auto notifySummoner = [](WorldObject* summonerObject, Creature* deadSummon, Unit* summonKiller)
                 {
-                    summoner->ToCreature()->AI()->SummonedCreatureDies(creature, killer);
-                }
-                else if (summoner->ToGameObject() && summoner->ToGameObject()->AI())
-                {
-                    summoner->ToGameObject()->AI()->SummonedCreatureDies(creature, killer);
-                }
+                    if (summonerObject->ToCreature() && summonerObject->ToCreature()->IsAIEnabled)
+                    {
+                        summonerObject->ToCreature()->AI()->SummonedCreatureDies(deadSummon, summonKiller);
+                    }
+                    else if (summonerObject->ToGameObject() && summonerObject->ToGameObject()->AI())
+                    {
+                        summonerObject->ToGameObject()->AI()->SummonedCreatureDies(deadSummon, summonKiller);
+                    }
+                };
+
+                // the summoner can be far, in another task's area: its AI is told on its owner
+                if (killMap->CanWriteNow(summoner))
+                    notifySummoner(summoner, creature, killer);
+                else
+                    killMap->RunOnOwner(summoner, [notifySummoner, summonGuid = creature->GetGUID(),
+                        killerGuid = killer ? killer->GetGUID() : ObjectGuid::Empty](WorldObject* target)
+                    {
+                        Creature* deadSummon = ObjectAccessor::GetCreature(*target, summonGuid);
+                        if (!deadSummon)
+                            return;
+
+                        Unit* summonKiller = killerGuid ? ObjectAccessor::GetUnit(*target, killerGuid) : nullptr;
+                        notifySummoner(target, deadSummon, summonKiller);
+                    });
             }
         }
 
@@ -15236,6 +15356,8 @@ void Unit::GetPartyMembers(std::list<Unit*>& TagUnitMap)
     {
         uint8 subgroup = owner->ToPlayer()->GetSubGroup();
 
+        // other maps' threads and tasks change the member list
+        std::lock_guard<std::recursive_mutex> groupGuard(group->GetLock());
         for (GroupReference* itr = group->GetFirstMember(); itr != nullptr; itr = itr->next())
         {
             Player* Target = itr->GetSource();
@@ -15245,6 +15367,10 @@ void Unit::GetPartyMembers(std::list<Unit*>& TagUnitMap)
             {
                 if (Target->IsAlive())
                     TagUnitMap.push_back(Target);
+
+                // a far member's controlled set is written by its own task, in another task's area: not walked
+                if (!GetMap()->CanWriteNow(Target))
+                    continue;
 
                 for (Unit::ControlSet::iterator iterator = Target->m_Controlled.begin(); iterator != Target->m_Controlled.end(); ++iterator)
                 {
@@ -15260,12 +15386,14 @@ void Unit::GetPartyMembers(std::list<Unit*>& TagUnitMap)
         if (owner->IsAlive())
             TagUnitMap.push_back(owner);
 
-        for (Unit::ControlSet::iterator itr = owner->m_Controlled.begin(); itr != owner->m_Controlled.end(); ++itr)
-        {
-            if (Unit* pet = *itr)
-                if (pet->IsGuardian() && pet->IsAlive())
-                    TagUnitMap.push_back(pet);
-        }
+        // a far owner's controlled set is written by its own task, in another task's area: not walked
+        if (GetMap()->CanWriteNow(owner))
+            for (Unit::ControlSet::iterator itr = owner->m_Controlled.begin(); itr != owner->m_Controlled.end(); ++itr)
+            {
+                if (Unit* pet = *itr)
+                    if (pet->IsGuardian() && pet->IsAlive())
+                        TagUnitMap.push_back(pet);
+            }
     }
 }
 
