@@ -49,6 +49,7 @@
 #include "WorldPacket.h"
 #include "WorldState.h"
 #include "WorldStateDefines.h"
+#include <mutex>
 #include <unordered_map>
 
 bool BattlegroundTemplate::IsArena() const
@@ -131,11 +132,14 @@ void BattlegroundMgr::Update(uint32 diff)
         m_BattlegroundQueues[qtype].UpdateEvents(diff);
 
     // update using scheduled tasks (used only for rated arenas, initial opponent search works differently than periodic queue update)
-    if (!m_QueueUpdateScheduler.empty())
+    std::vector<uint64> scheduled;
     {
-        std::vector<uint64> scheduled;
+        std::lock_guard<Acore::SpinLock> guard(m_QueueUpdateSchedulerLock);
         std::swap(scheduled, m_QueueUpdateScheduler);
+    }
 
+    if (!scheduled.empty())
+    {
         for (uint8 i = 0; i < scheduled.size(); i++)
         {
             uint32 arenaMMRating = scheduled[i] >> 32;
@@ -771,9 +775,9 @@ void BattlegroundMgr::SetHolidayWeekends(uint32 mask)
 
 void BattlegroundMgr::ScheduleQueueUpdate(uint32 arenaMatchmakerRating, uint8 arenaType, BattlegroundQueueTypeId bgQueueTypeId, BattlegroundTypeId bgTypeId, BattlegroundBracketId bracket_id)
 {
-    //This method must be atomic, @todo add mutex
     //we will use only 1 number created of bgTypeId and bracket_id
     uint64 const scheduleId = ((uint64)arenaMatchmakerRating << 32) | ((uint64)arenaType << 24) | ((uint64)bgQueueTypeId << 16) | ((uint64)bgTypeId << 8) | (uint64)bracket_id;
+    std::lock_guard<Acore::SpinLock> guard(m_QueueUpdateSchedulerLock);
     if (std::find(m_QueueUpdateScheduler.begin(), m_QueueUpdateScheduler.end(), scheduleId) == m_QueueUpdateScheduler.end())
         m_QueueUpdateScheduler.emplace_back(scheduleId);
 }
