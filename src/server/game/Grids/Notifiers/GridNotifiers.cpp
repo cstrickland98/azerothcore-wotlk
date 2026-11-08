@@ -36,25 +36,23 @@ void VisibleNotifier::Visit(GameObjectMapType& m)
 void VisibleNotifier::SendToSelf()
 {
     // Update far visible objects
-    ZoneWideVisibleWorldObjectsSet const* zoneWideVisibleObjects = i_player.GetMap()->GetZoneWideVisibleWorldObjectsForZone(i_player.GetZoneId());
-    if (zoneWideVisibleObjects)
+    std::vector<WorldObject*> zoneWideVisibleObjects;
+    i_player.GetMap()->GetZoneWideVisibleWorldObjectsForZone(i_player.GetZoneId(), zoneWideVisibleObjects);
+    for (WorldObject* obj : zoneWideVisibleObjects)
     {
-        for (WorldObject* obj : *zoneWideVisibleObjects)
+        switch (obj->GetTypeId())
         {
-            switch (obj->GetTypeId())
-            {
-                case TYPEID_GAMEOBJECT:
-                    i_player.UpdateVisibilityOf(obj->ToGameObject(), i_data, i_visibleNow);
-                    break;
-                case TYPEID_UNIT:
-                    i_player.UpdateVisibilityOf(obj->ToCreature(), i_data, i_visibleNow);
-                    break;
-                case TYPEID_DYNAMICOBJECT:
-                    i_player.UpdateVisibilityOf(obj->ToDynObject(), i_data, i_visibleNow);
-                    break;
-                default:
-                    break;
-            }
+            case TYPEID_GAMEOBJECT:
+                i_player.UpdateVisibilityOf(obj->ToGameObject(), i_data, i_visibleNow);
+                break;
+            case TYPEID_UNIT:
+                i_player.UpdateVisibilityOf(obj->ToCreature(), i_data, i_visibleNow);
+                break;
+            case TYPEID_DYNAMICOBJECT:
+                i_player.UpdateVisibilityOf(obj->ToDynObject(), i_data, i_visibleNow);
+                break;
+            default:
+                break;
         }
     }
 

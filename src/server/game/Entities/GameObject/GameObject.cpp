@@ -202,9 +202,12 @@ void GameObject::AddToWorld()
         if (m_zoneScript)
             m_zoneScript->OnGameObjectCreate(this);
 
-        GetMap()->GetObjectsStore().Insert<GameObject>(GetGUID(), this);
-        if (m_spawnId)
-            GetMap()->GetGameObjectBySpawnIdStore().insert(std::make_pair(m_spawnId, this));
+        {
+            auto storeGuard = GetMap()->LockObjectsStoreForWrite();
+            GetMap()->GetObjectsStore().Insert<GameObject>(GetGUID(), this);
+            if (m_spawnId)
+                GetMap()->GetGameObjectBySpawnIdStore().insert(std::make_pair(m_spawnId, this));
+        }
 
         if (m_model)
         {
@@ -249,6 +252,7 @@ void GameObject::RemoveFromWorld()
 
         WorldObject::RemoveFromWorld();
 
+        auto storeGuard = GetMap()->LockObjectsStoreForWrite();
         if (m_spawnId)
             Acore::Containers::MultimapErasePair(GetMap()->GetGameObjectBySpawnIdStore(), m_spawnId, this);
         GetMap()->GetObjectsStore().Remove<GameObject>(GetGUID());

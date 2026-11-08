@@ -312,10 +312,13 @@ void Creature::AddToWorld()
         // it's also initialized in AIM_Initialize(), few lines below, but it's not a problem
         Motion_Initialize();
 
-        GetMap()->GetObjectsStore().Insert<Creature>(GetGUID(), this);
-        if (m_spawnId)
         {
-            GetMap()->GetCreatureBySpawnIdStore().insert(std::make_pair(m_spawnId, this));
+            auto storeGuard = GetMap()->LockObjectsStoreForWrite();
+            GetMap()->GetObjectsStore().Insert<Creature>(GetGUID(), this);
+            if (m_spawnId)
+            {
+                GetMap()->GetCreatureBySpawnIdStore().insert(std::make_pair(m_spawnId, this));
+            }
         }
         Unit::AddToWorld();
 
@@ -356,6 +359,7 @@ void Creature::RemoveFromWorld()
 
         Unit::RemoveFromWorld();
 
+        auto storeGuard = GetMap()->LockObjectsStoreForWrite();
         if (m_spawnId)
             Acore::Containers::MultimapErasePair(GetMap()->GetCreatureBySpawnIdStore(), m_spawnId, this);
 
@@ -1696,22 +1700,31 @@ bool Creature::LoadCreatureFromDB(ObjectGuid::LowType spawnId, Map* map, bool ad
     {
         // If an alive instance of this spawnId is already found, skip creation
         // If only dead instance(s) exist, despawn them and spawn a new (maybe also dead) version
-        const auto creatureBounds = map->GetCreatureBySpawnIdStore().equal_range(spawnId);
-        std::vector <Creature*> despawnList;
-
-        if (creatureBounds.first != creatureBounds.second)
+        std::vector<Creature*> spawnedCreatures;
         {
+            auto storeGuard = map->LockObjectsStoreForRead();
+            auto const creatureBounds = map->GetCreatureBySpawnIdStore().equal_range(spawnId);
             for (auto itr = creatureBounds.first; itr != creatureBounds.second; ++itr)
+                spawnedCreatures.push_back(itr->second);
+        }
+
+        std::vector<Creature*> despawnList;
+
+        if (!spawnedCreatures.empty())
+        {
+            for (Creature* creature : spawnedCreatures)
             {
-                if (itr->second->IsAlive())
+                if (creature->IsAlive())
                 {
-                    LOG_DEBUG("maps", "Would have spawned {} but {} already exists", spawnId, creatureBounds.first->second->GetGUID().ToString());
+                    LOG_DEBUG("maps", "Would have spawned {} but {} already exists", spawnId,
+                        spawnedCreatures.front()->GetGUID().ToString());
                     return false;
                 }
                 else
                 {
-                    despawnList.push_back(itr->second);
-                    LOG_DEBUG("maps", "Despawned dead instance of spawn {} ({})", spawnId, itr->second->GetGUID().ToString());
+                    despawnList.push_back(creature);
+                    LOG_DEBUG("maps", "Despawned dead instance of spawn {} ({})", spawnId,
+                        creature->GetGUID().ToString());
                 }
             }
 
