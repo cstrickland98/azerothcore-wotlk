@@ -101,6 +101,8 @@ private:
 
     bool Update(uint32 tdiff);
     void RefreshTimer();
+    // the timer ran out in Update and has not been refreshed since
+    bool IsExpired() const { return _combatTimer == 0; }
 
     uint32 _combatTimer = PVP_COMBAT_TIMEOUT;
 
