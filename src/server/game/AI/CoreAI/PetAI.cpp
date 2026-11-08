@@ -20,6 +20,7 @@
 #include "Creature.h"
 #include "Errors.h"
 #include "Group.h"
+#include "Map.h"
 #include "ObjectAccessor.h"
 #include "Pet.h"
 #include "Player.h"
@@ -633,7 +634,17 @@ void PetAI::DoAttack(Unit* target, bool chase)
     {
         // xinef: properly fix fake combat after pet is sent to attack
         if (Unit* owner = me->GetOwner())
-            owner->SetUnitFlag(UNIT_FLAG_PET_IN_COMBAT);
+        {
+            // the owner can be far, in another task's area
+            if (me->GetMap()->CanWriteNow(owner))
+                owner->SetUnitFlag(UNIT_FLAG_PET_IN_COMBAT);
+            else
+                me->GetMap()->RunOnOwner(owner, [](WorldObject* target)
+                {
+                    if (Unit* unit = target->ToUnit())
+                        unit->SetUnitFlag(UNIT_FLAG_PET_IN_COMBAT);
+                });
+        }
 
         me->SetUnitFlag(UNIT_FLAG_PET_IN_COMBAT);
 

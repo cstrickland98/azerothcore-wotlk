@@ -7350,7 +7350,14 @@ bool Unit::Attack(Unit* victim, bool meleeAttack)
             }
             return false;
         }
+    }
 
+    // the victim can be far, in another task's area: it is not linked now, the attacker retries on a later tick
+    if (GetMap()->IsParallelPhase() && !GetMap()->CanWriteNow(victim))
+        return false;
+
+    if (m_attacking)
+    {
         // switch target
         InterruptSpell(CURRENT_MELEE_SPELL, true, true, true);
         if (!meleeAttack)
@@ -8365,7 +8372,17 @@ void Unit::UnsummonAllTotems(bool onDeath /*= false*/)
             {
                 if (!(onDeath && !IsPlayer() && OldTotem->IsGuardian()))
                 {
-                    OldTotem->ToTempSummon()->UnSummon();
+                    // the summon can be far, in another task's area (its owner teleported away from it)
+                    if (GetMap()->CanWriteNow(OldTotem))
+                        OldTotem->ToTempSummon()->UnSummon();
+                    else
+                        GetMap()->RunOnOwner(OldTotem, [](WorldObject* target)
+                        {
+                            if (Creature* creature = target->ToCreature())
+                                if (TempSummon* summon = creature->ToTempSummon())
+                                    if (summon->IsInWorld())
+                                        summon->UnSummon();
+                        });
                 }
             }
         }
@@ -10745,7 +10762,16 @@ void Unit::ClearInPetCombat()
     RemoveAurasWithInterruptFlags(AURA_INTERRUPT_FLAG_LEAVE_COMBAT);
     if (Unit* owner = GetOwner())
     {
-        owner->RemoveUnitFlag(UNIT_FLAG_PET_IN_COMBAT);
+        // the owner can be far, in another task's area (the pet is returning to an owner that walked away)
+        Map* map = FindMap();
+        if (!map || map->CanWriteNow(owner))
+            owner->RemoveUnitFlag(UNIT_FLAG_PET_IN_COMBAT);
+        else
+            map->RunOnOwner(owner, [](WorldObject* target)
+            {
+                if (Unit* unit = target->ToUnit())
+                    unit->RemoveUnitFlag(UNIT_FLAG_PET_IN_COMBAT);
+            });
     }
 }
 
