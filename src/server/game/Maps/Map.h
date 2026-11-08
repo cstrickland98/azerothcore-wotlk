@@ -287,6 +287,8 @@ public:
     // (target resolved again by GUID, skipped if gone). fn must capture values and GUIDs, never object pointers.
     void RunOnOwner(WorldObject* target, std::function<void(WorldObject*)> fn);
     void RunOnOwner(ObjectGuid target, std::function<void(WorldObject*)> fn);
+    // Runs fn in the serial step after the running phase when called from a worker of this map, otherwise now
+    void DeferToPhaseEnd(std::function<void()> fn);
     [[nodiscard]] uint32 GetThreadsPerMap() const { return _threadsPerMap; }
     void SetThreadsPerMap(uint32 threads);
     // Grid of obj as the ownership rule sees it: a player's from its position, others' from their current cell
@@ -693,7 +695,6 @@ private:
     void BuildGridTasks(bool fullTick);
     void RunGridTask(MapGridTask& task, uint32 workerIndex, uint32 t_diff, uint32 s_diff, bool recheck);
     void FinishPhase();
-    void DeferToPhaseEnd(std::function<void()> fn);
     void ForgetDelayedVisibility(Unit* unit);
     WorldObject* FindObjectForDeferredOp(ObjectGuid const& guid);
     void LogThreadingStats();

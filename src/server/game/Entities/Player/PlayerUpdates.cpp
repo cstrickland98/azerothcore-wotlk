@@ -1519,15 +1519,25 @@ void Player::UpdateFFAPvPState(bool reset /*= true*/)
 
             // xinef: iterate attackers
             AttackerSet        toRemove;
-            AttackerSet const& attackers = getAttackers();
+            AttackerSet        attackersCopy;
+            AttackerSet const& attackers = GetAttackersForIteration(attackersCopy);
             for (AttackerSet::const_iterator itr = attackers.begin();
                  itr != attackers.end(); ++itr)
                 if (!(*itr)->IsValidAttackTarget(this))
                     toRemove.insert(*itr);
 
-            for (AttackerSet::const_iterator itr = toRemove.begin();
-                 itr != toRemove.end(); ++itr)
-                (*itr)->AttackStop();
+            for (Unit* attacker : toRemove)
+            {
+                if (GetMap()->CanWriteNow(attacker))
+                    attacker->AttackStop();
+                else
+                    GetMap()->RunOnOwner(attacker, [victimGuid = GetGUID()](WorldObject* target)
+                    {
+                        Unit* unit = target->ToUnit();
+                        if (unit && unit->GetVictim() && unit->GetVictim()->GetGUID() == victimGuid)
+                            unit->AttackStop();
+                    });
+            }
 
             // xinef: remove our own victim
             if (Unit* victim = GetVictim())

@@ -5410,32 +5410,6 @@ void Spell::SendChannelStart(uint32 duration)
     unitCaster->SetUInt32Value(UNIT_CHANNEL_SPELL, m_spellInfo->Id);
 }
 
-void Spell::SendResurrectRequest(Player* target)
-{
-    Unit* unitCaster = m_caster->ToUnit();
-    if (!unitCaster)
-        return;
-
-    // get resurrector name for creature resurrections, otherwise packet will be not accepted
-    // for player resurrections the name is looked up by guid
-    std::string const sentName(unitCaster->IsPlayer()
-                               ? ""
-                               : unitCaster->GetNameForLocaleIdx(target->GetSession()->GetSessionDbLocaleIndex()));
-
-    WorldPacket data(SMSG_RESURRECT_REQUEST, (8 + 4 + sentName.size() + 1 + 1 + 1 + 4));
-    data << unitCaster->GetGUID();
-    data << uint32(sentName.size() + 1);
-
-    data << sentName;
-    data << uint8(0); // null terminator
-
-    data << uint8(unitCaster->IsPlayer() ? 0 : 1); // "you'll be afflicted with resurrection sickness"
-    // override delay sent with SMSG_CORPSE_RECLAIM_DELAY, set instant resurrection for spells with this attribute
-    if (m_spellInfo->HasAttribute(SPELL_ATTR3_NO_RES_TIMER))
-        data << uint32(0);
-    target->SendDirectMessage(&data);
-}
-
 void Spell::TakeCastItem()
 {
     Unit* unitCaster = m_caster->ToUnit();
