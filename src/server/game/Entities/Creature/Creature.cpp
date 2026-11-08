@@ -32,6 +32,7 @@
 #include "GroupMgr.h"
 #include "Log.h"
 #include "LootMgr.h"
+#include "MapThreading.h"
 #include "ObjectMgr.h"
 #include "Opcodes.h"
 #include "Pet.h"
@@ -2197,9 +2198,24 @@ void Creature::Respawn(bool force)
 
 void Creature::ForcedDespawn(Milliseconds timeMSToDespawn, Seconds forceRespawnTimer)
 {
+    // Called from another unit's update (summon lists, SmartAI stored targets, scripts) this creature can be far,
+    // in another task's area of a parallel map phase: both the delayed event and the immediate despawn write it,
+    // so they run on its owner (the serial step after the phase), looked up again by GUID.
+    if (Map* map = FindMap(); map && map->IsParallelPhase() && !map->CanWriteNow(this))
+    {
+        map->RunOnOwner(this, [timeMSToDespawn, forceRespawnTimer](WorldObject* target)
+        {
+            if (Creature* creature = target->ToCreature())
+                if (creature->IsInWorld())
+                    creature->ForcedDespawn(timeMSToDespawn, forceRespawnTimer);
+        });
+        return;
+    }
+
     if (timeMSToDespawn > 0ms)
     {
         ForcedDespawnDelayEvent* pEvent = new ForcedDespawnDelayEvent(*this, forceRespawnTimer);
+        MT_ASSERT_WRITABLE(this);
         m_Events.AddEventAtOffset(pEvent, timeMSToDespawn);
         return;
     }
