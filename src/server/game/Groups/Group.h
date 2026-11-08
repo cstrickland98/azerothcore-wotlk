@@ -25,6 +25,7 @@
 #include "QueryResult.h"
 #include "SharedDefines.h"
 #include <functional>
+#include <mutex>
 
 class Battlefield;
 class Battleground;
@@ -338,6 +339,10 @@ public:
     void SetDifficultyChangePrevention(DifficultyPreventionChangeType type);
     void DoForAllMembers(std::function<void(Player*)> const& worker);
 
+    // Taken by every mutator and member iteration; members on several map threads share the group.
+    // Hold it while walking GetFirstMember() / GetMemberSlots() from outside.
+    std::recursive_mutex& GetLock() const { return _lock; }
+
     DataMap CustomData;
 
 protected:
@@ -379,5 +384,7 @@ protected:
     // Xinef: change difficulty prevention
     uint32 _difficultyChangePreventionTime;
     DifficultyPreventionChangeType _difficultyChangePreventionType;
+
+    mutable std::recursive_mutex _lock;
 };
 #endif
