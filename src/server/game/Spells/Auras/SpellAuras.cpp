@@ -463,16 +463,18 @@ void Aura::_ApplyForTarget(Unit* target, Unit* caster, AuraApplication* auraApp)
     InvalidateStaticOnOwner();
 
     // set infinity cooldown state for spells
+    // Runs on the target's task; the caster (a soulstone's warlock) can be updated by another task, which owns its
+    // cooldowns
     if (m_spellInfo->IsCooldownStartedOnEvent() && !m_castItemGuid && caster)
     {
-        if (caster->IsPlayer())
+        SpellInfo const* spellInfo = m_spellInfo;
+        caster->GetMap()->RunOnOwner(caster, [spellInfo](WorldObject* owner)
         {
-            caster->ToPlayer()->AddSpellAndCategoryCooldowns(m_spellInfo, 0, nullptr, true);
-        }
-        else
-        {
-            caster->ToCreature()->AddSpellCooldown(m_spellInfo->Id, 0, infinityCooldownDelay);
-        }
+            if (Player* player = owner->ToPlayer())
+                player->AddSpellAndCategoryCooldowns(spellInfo, 0, nullptr, true);
+            else if (Creature* creature = owner->ToCreature())
+                creature->AddSpellCooldown(spellInfo->Id, 0, infinityCooldownDelay);
+        });
     }
 }
 
@@ -508,37 +510,36 @@ void Aura::_UnapplyForTarget(Unit* target, Unit* caster, AuraApplication* auraAp
     InvalidateStaticOnOwner();
 
     // reset cooldown state for spells
+    // Runs on the target's task; the caster's cooldowns are written on the caster's task (see _ApplyForTarget)
     if (m_spellInfo->IsCooldownStartedOnEvent() && !m_castItemGuid && caster)
     {
-        if (caster->IsPlayer())
+        SpellInfo const* spellInfo = m_spellInfo;
+        caster->GetMap()->RunOnOwner(caster, [spellInfo](WorldObject* casterObject)
         {
-            // note: item based cooldowns and cooldown spell mods with charges ignored (unknown existed cases)
-            caster->ToPlayer()->SendCooldownEvent(GetSpellInfo());
-        }
-        else
-        {
-            caster->ToCreature()->AddSpellCooldown(m_spellInfo->Id, 0, 0);
+            if (Player* player = casterObject->ToPlayer())
+            {
+                // note: item based cooldowns and cooldown spell mods with charges ignored (unknown existed cases)
+                player->SendCooldownEvent(spellInfo);
+                return;
+            }
 
-            if (Unit* owner = caster->GetCharmerOrOwner())
+            Creature* creature = casterObject->ToCreature();
+            if (!creature)
+                return;
+
+            creature->AddSpellCooldown(spellInfo->Id, 0, 0);
+
+            if (Unit* owner = creature->GetCharmerOrOwner())
             {
                 if (Player* playerOwner = owner->ToPlayer())
                 {
                     WorldPacket data(SMSG_COOLDOWN_EVENT, 4 + 8);
-                    data << uint32(m_spellInfo->Id);
-                    data << caster->GetGUID();
+                    data << uint32(spellInfo->Id);
+                    data << creature->GetGUID();
                     playerOwner->SendDirectMessage(&data);
                 }
             }
-        }
-    }
-
-    if (caster && caster->IsPlayer())
-    {
-        if (GetSpellInfo()->IsCooldownStartedOnEvent() && !m_castItemGuid)
-        {
-            // note: item based cooldowns and cooldown spell mods with charges ignored (unknown existed cases)
-            caster->ToPlayer()->SendCooldownEvent(GetSpellInfo());
-        }
+        });
     }
 }
 

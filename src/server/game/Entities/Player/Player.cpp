@@ -3717,6 +3717,7 @@ bool Player::Has310Flyer(bool checkAllSpells, uint32 excludeSpellId)
 
 void Player::RemoveSpellCooldown(uint32 spell_id, bool update /* = false */)
 {
+    MT_ASSERT_WRITABLE(this);
     m_spellCooldowns.erase(spell_id);
 
     if (update)
@@ -11312,6 +11313,7 @@ void Player::AddSpellAndCategoryCooldowns(SpellInfo const* spellInfo, uint32 ite
 
 void Player::_AddSpellCooldown(uint32 spellid, uint16 categoryId, uint32 itemid, uint32 end_time, bool needSendToClient, bool forceSendToSpectator)
 {
+    MT_ASSERT_WRITABLE(this);
     SpellCooldown sc;
     sc.end = GameTime::GetGameTimeMS().count() + end_time;
     sc.category = categoryId;
