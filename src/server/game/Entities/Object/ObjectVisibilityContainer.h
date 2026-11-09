@@ -55,6 +55,12 @@ public:
     // this is used before a worldobject is deleted to prevent any dangling references
     void CleanVisibilityReferences();
 
+    // CleanVisibilityReferences for an object leaving the world, and refuse new links until Reopen():
+    // a task that still holds the object from an earlier snapshot must not link it again after the cleanup,
+    // or the other side keeps a pointer to an object that is about to be deleted
+    void CloseForRemoval();
+    void Reopen();
+
     void LinkWorldObjectVisibility(WorldObject* worldObject);
     void UnlinkWorldObjectVisibility(WorldObject* worldObject);
 
@@ -103,6 +109,8 @@ private:
 
     // Aborts when this container was destroyed: a write reached it through a stale pointer.
     void AssertAlive(ObjectGuid key) const;
+
+    void CleanReferences(bool close);
 
     // Copy the map's values under the lock. A map whose node chain was damaged by a stray write would be
     // iterated forever here, allocating until memory runs out: both abort as soon as the copy outgrows size().
@@ -162,6 +170,9 @@ private:
     static constexpr uint32 ALIVE = 0x4F564341;
     static constexpr uint32 DEAD = 0xDEADDEAD;
     std::atomic<uint32> _aliveMagic;
+
+    // Set by CloseForRemoval, cleared by Reopen; guarded by _lock
+    bool _closed;
 
     // Protects _visibleWorldObjectsMap and _visiblePlayersMap
     mutable Acore::SpinLock _lock;

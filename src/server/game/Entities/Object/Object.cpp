@@ -1251,6 +1251,7 @@ void WorldObject::ProcessPositionDataChanged(PositionFullTerrainStatus const& da
 void WorldObject::AddToWorld()
 {
     Object::AddToWorld();
+    GetObjectVisibilityContainer().Reopen();
     GetMap()->GetZoneAndAreaId(GetPhaseMask(), _zoneId, _areaId, GetPositionX(), GetPositionY(), GetPositionZ());
     GetMap()->AddObjectToPendingUpdateList(this);
 
@@ -1267,7 +1268,7 @@ void WorldObject::RemoveFromWorld()
 
     DestroyForVisiblePlayers();
 
-    GetObjectVisibilityContainer().CleanVisibilityReferences();
+    GetObjectVisibilityContainer().CloseForRemoval();
 
     Object::RemoveFromWorld();
 }
