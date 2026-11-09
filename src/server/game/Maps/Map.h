@@ -54,6 +54,7 @@
 
 class Unit;
 class Creature;
+class Corpse;
 class GameObject;
 class DynamicObject;
 class MapWorkerPool;
@@ -198,6 +199,7 @@ struct MapWorkerScratch
     std::vector<WorldObject*> updatableRemove;
     std::vector<GridCoord> gridLoads;
     std::vector<DeferredOp> deferred;
+    std::vector<Corpse*> corpsesToDelete;                   // DeleteCorpse during the phase
 
     double heaviestTaskMs{0.0};
     uint32 heaviestTaskX{0};
@@ -717,6 +719,11 @@ private:
     void RunGridTask(MapGridTask& task, uint32 workerIndex, uint32 t_diff, uint32 s_diff, bool recheck);
     void FinishPhase();
     void ForgetRemovedThisTick(WorldObject* obj);
+
+    // Frees a corpse that RemoveCorpse took out of the map. During a phase the task of a neighbour grid can still
+    // hold it in a visibility snapshot (VisibleNotifier::SendToSelf), and would read and unlink the freed corpse:
+    // it is freed in FinishPhase instead.
+    void DeleteCorpse(Corpse* corpse);
     void LogThreadingStats();
 
     template<class T> void InitializeObject(T* obj);
