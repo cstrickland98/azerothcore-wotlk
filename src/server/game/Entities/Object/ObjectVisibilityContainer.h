@@ -23,8 +23,10 @@
 #include "ObjectGuid.h"
 #include "SpinLock.h"
 #include <atomic>
+#include <cstddef>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -32,8 +34,38 @@
 class Player;
 class WorldObject;
 
-typedef std::unordered_map<ObjectGuid, WorldObject*> VisibleWorldObjectsMap;
-typedef std::unordered_map<ObjectGuid, Player*> VisiblePlayersMap;
+// Diagnostic for the intra-map heap corruption hunt: the visibility maps keep their nodes in a private heap,
+// so a stale write from another container can no longer land in them, and every block carries a guard that
+// aborts on a double or foreign free (the second freer's stack is the racing writer).
+namespace VisibilityHeap
+{
+    void* Allocate(std::size_t bytes);
+    void Deallocate(void* p, std::size_t bytes);
+}
+
+template<typename T>
+class VisibilityAllocator
+{
+public:
+    using value_type = T;
+
+    VisibilityAllocator() noexcept = default;
+    template<typename U>
+    VisibilityAllocator(VisibilityAllocator<U> const&) noexcept { }
+
+    T* allocate(std::size_t n) { return static_cast<T*>(VisibilityHeap::Allocate(n * sizeof(T))); }
+    void deallocate(T* p, std::size_t n) noexcept { VisibilityHeap::Deallocate(p, n * sizeof(T)); }
+
+    template<typename U>
+    bool operator==(VisibilityAllocator<U> const&) const noexcept { return true; }
+    template<typename U>
+    bool operator!=(VisibilityAllocator<U> const&) const noexcept { return false; }
+};
+
+typedef std::unordered_map<ObjectGuid, WorldObject*, std::hash<ObjectGuid>, std::equal_to<ObjectGuid>,
+    VisibilityAllocator<std::pair<ObjectGuid const, WorldObject*>>> VisibleWorldObjectsMap;
+typedef std::unordered_map<ObjectGuid, Player*, std::hash<ObjectGuid>, std::equal_to<ObjectGuid>,
+    VisibilityAllocator<std::pair<ObjectGuid const, Player*>>> VisiblePlayersMap;
 
 // Class that manages the visibility containers of a worldobject
 // Thread safety: with intra-map threading the maps are written from several map threads
@@ -179,7 +211,7 @@ private:
 
     // List of all worldobjects that are visible to us (including other players)
     // Only players contain this map, thus we will only allocate it as needed.
-    std::unique_ptr<VisibleWorldObjectsMap> _visibleWorldObjectsMap;
+    std::optional<VisibleWorldObjectsMap> _visibleWorldObjectsMap;
 
     // List of players who are currently able to see this worldobject.
     // All worldobjects will contain this map
