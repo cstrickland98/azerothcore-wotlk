@@ -22,6 +22,7 @@
 #include "Errors.h"
 #include "ObjectGuid.h"
 #include "SpinLock.h"
+#include <atomic>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -94,6 +95,13 @@ public:
     }
 
 private:
+    // Aborts when `object`, reached through one of our maps under `key`, was destroyed (or its memory reused)
+    // while we still listed it: the dangling entry would make us write into freed memory.
+    void AssertListedObjectAlive(WorldObject const* object, ObjectGuid key) const;
+
+    // Aborts when this container was destroyed: a write reached it through a stale pointer.
+    void AssertAlive(ObjectGuid key) const;
+
     // Copy the map's values under the lock. A map whose node chain was damaged by a stray write would be
     // iterated forever here, allocating until memory runs out: both abort as soon as the copy outgrows size().
     void SnapshotVisiblePlayers(std::vector<Player*>& out) const;
@@ -150,6 +158,12 @@ private:
     void DirectRemoveVisiblePlayerReference(ObjectGuid guid);
 
     WorldObject* _selfObject;
+
+    // ALIVE while the owner exists, DEAD once destroyed: freed memory keeps DEAD until it is reused,
+    // so a stale pointer that reaches this container is caught by the writer, not by a later reader.
+    static constexpr uint32 ALIVE = 0x4F564341;
+    static constexpr uint32 DEAD = 0xDEADDEAD;
+    std::atomic<uint32> _aliveMagic;
 
     // Protects _visibleWorldObjectsMap and _visiblePlayersMap
     mutable Acore::SpinLock _lock;

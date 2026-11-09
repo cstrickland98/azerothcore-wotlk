@@ -16,6 +16,7 @@
  */
 
 #include "ObjectVisibilityContainer.h"
+#include "MapThreading.h"
 #include "Object.h"
 #include "Player.h"
 
@@ -28,7 +29,7 @@
 */
 
 ObjectVisibilityContainer::ObjectVisibilityContainer(WorldObject* selfObject) :
-    _selfObject(selfObject)
+    _selfObject(selfObject), _aliveMagic(ALIVE)
 {
 }
 
@@ -37,6 +38,21 @@ ObjectVisibilityContainer::~ObjectVisibilityContainer()
     ASSERT(_visiblePlayersMap.empty());
     if (_visibleWorldObjectsMap)
         ASSERT((*_visibleWorldObjectsMap).empty());
+    _aliveMagic.store(DEAD, std::memory_order_relaxed);
+}
+
+void ObjectVisibilityContainer::AssertListedObjectAlive(WorldObject const* object, ObjectGuid key) const
+{
+    if (object->GetObjectVisibilityContainer()._aliveMagic.load(std::memory_order_relaxed) != ALIVE)
+        ABORT("ObjectVisibilityContainer: {} lists {} at {}, which was destroyed", _selfObject->GetGUID().ToString(), key.ToString(), static_cast<void const*>(object));
+    if (object->GetGUID() != key)
+        ABORT("ObjectVisibilityContainer: {} lists {} at {}, whose memory now holds {}", _selfObject->GetGUID().ToString(), key.ToString(), static_cast<void const*>(object), object->GetGUID().ToString());
+}
+
+void ObjectVisibilityContainer::AssertAlive(ObjectGuid key) const
+{
+    if (_aliveMagic.load(std::memory_order_relaxed) != ALIVE)
+        ABORT("ObjectVisibilityContainer: write for {} into the destroyed container at {}", key.ToString(), static_cast<void const*>(this));
 }
 
 void ObjectVisibilityContainer::InitForPlayer()
@@ -59,10 +75,16 @@ void ObjectVisibilityContainer::CleanVisibilityReferences()
     ObjectGuid const selfGuid = _selfObject->GetGUID();
 
     for (auto const& kvPair : visiblePlayers)
+    {
+        AssertListedObjectAlive(kvPair.second, kvPair.first);
         kvPair.second->GetObjectVisibilityContainer().DirectRemoveVisibilityReference(selfGuid);
+    }
 
     for (auto const& kvPair : visibleWorldObjects)
+    {
+        AssertListedObjectAlive(kvPair.second, kvPair.first);
         kvPair.second->GetObjectVisibilityContainer().DirectRemoveVisiblePlayerReference(selfGuid);
+    }
 }
 
 void ObjectVisibilityContainer::LinkWorldObjectVisibility(WorldObject* worldObject)
@@ -75,13 +97,15 @@ void ObjectVisibilityContainer::LinkWorldObjectVisibility(WorldObject* worldObje
     if (worldObject->IsGameObject() && worldObject->ToGameObject()->IsTransport())
         return;
 
+    // Only players can link visibility (set once at construction time, no lock needed for the check)
+    if (!_visibleWorldObjectsMap)
+        return;
+
+    AssertAlive(worldObject->GetGUID());
+    MT_ASSERT_WRITABLE(_selfObject);
+
     {
         std::lock_guard<Acore::SpinLock> guard(_lock);
-
-        // Only players can link visibility
-        if (!_visibleWorldObjectsMap)
-            return;
-
         _visibleWorldObjectsMap->insert(std::make_pair(worldObject->GetGUID(), worldObject));
     }
 
@@ -94,6 +118,9 @@ void ObjectVisibilityContainer::UnlinkWorldObjectVisibility(WorldObject* worldOb
     if (!_visibleWorldObjectsMap)
         return;
 
+    AssertAlive(worldObject->GetGUID());
+    MT_ASSERT_WRITABLE(_selfObject);
+
     worldObject->GetObjectVisibilityContainer().DirectRemoveVisiblePlayerReference(_selfObject->GetGUID());
 
     std::lock_guard<Acore::SpinLock> guard(_lock);
@@ -102,6 +129,7 @@ void ObjectVisibilityContainer::UnlinkWorldObjectVisibility(WorldObject* worldOb
 
 void ObjectVisibilityContainer::UnlinkVisiblePlayer(Player* player)
 {
+    AssertAlive(player->GetGUID());
     {
         std::lock_guard<Acore::SpinLock> guard(_lock);
         _visiblePlayersMap.erase(player->GetGUID());
@@ -120,6 +148,7 @@ void ObjectVisibilityContainer::SnapshotVisiblePlayers(std::vector<Player*>& out
     {
         if (out.size() >= count)
             ABORT("ObjectVisibilityContainer: the visible players of {} (in world: {}) iterate past their size {}", _selfObject->GetGUID().ToString(), _selfObject->IsInWorld(), count);
+        AssertListedObjectAlive(kvPair.second, kvPair.first);
         out.push_back(kvPair.second);
     }
 }
@@ -137,6 +166,7 @@ void ObjectVisibilityContainer::SnapshotVisibleWorldObjects(std::vector<WorldObj
     {
         if (out.size() >= count)
             ABORT("ObjectVisibilityContainer: the visible objects of {} (in world: {}) iterate past their size {}", _selfObject->GetGUID().ToString(), _selfObject->IsInWorld(), count);
+        AssertListedObjectAlive(kvPair.second, kvPair.first);
         out.push_back(kvPair.second);
     }
 }
@@ -161,19 +191,23 @@ bool ObjectVisibilityContainer::IsWorldObjectVisible(ObjectGuid guid) const
 
 void ObjectVisibilityContainer::DirectRemoveVisibilityReference(ObjectGuid guid)
 {
+    AssertAlive(guid);
     ASSERT(_visibleWorldObjectsMap);
+    MT_ASSERT_WRITABLE(_selfObject);
     std::lock_guard<Acore::SpinLock> guard(_lock);
     _visibleWorldObjectsMap->erase(guid);
 }
 
 void ObjectVisibilityContainer::DirectInsertVisiblePlayerReference(Player* player)
 {
+    AssertAlive(player->GetGUID());
     std::lock_guard<Acore::SpinLock> guard(_lock);
     _visiblePlayersMap.insert(std::make_pair(player->GetGUID(), player));
 }
 
 void ObjectVisibilityContainer::DirectRemoveVisiblePlayerReference(ObjectGuid guid)
 {
+    AssertAlive(guid);
     std::lock_guard<Acore::SpinLock> guard(_lock);
     _visiblePlayersMap.erase(guid);
 }
