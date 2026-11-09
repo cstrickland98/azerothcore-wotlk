@@ -29,7 +29,7 @@
 */
 
 ObjectVisibilityContainer::ObjectVisibilityContainer(WorldObject* selfObject) :
-    _selfObject(selfObject), _aliveMagic(ALIVE)
+    _selfObject(selfObject), _aliveMagic(ALIVE), _closed(false)
 {
 }
 
@@ -62,11 +62,29 @@ void ObjectVisibilityContainer::InitForPlayer()
 
 void ObjectVisibilityContainer::CleanVisibilityReferences()
 {
+    CleanReferences(false);
+}
+
+void ObjectVisibilityContainer::CloseForRemoval()
+{
+    CleanReferences(true);
+}
+
+void ObjectVisibilityContainer::Reopen()
+{
+    std::lock_guard<Acore::SpinLock> guard(_lock);
+    _closed = false;
+}
+
+void ObjectVisibilityContainer::CleanReferences(bool close)
+{
     // Take our references out under the lock, then clean the other containers without holding it
     VisiblePlayersMap visiblePlayers;
     VisibleWorldObjectsMap visibleWorldObjects;
     {
         std::lock_guard<Acore::SpinLock> guard(_lock);
+        if (close)
+            _closed = true;
         visiblePlayers.swap(_visiblePlayersMap);
         if (_visibleWorldObjectsMap)
             visibleWorldObjects.swap(*_visibleWorldObjectsMap);
@@ -107,6 +125,9 @@ void ObjectVisibilityContainer::LinkWorldObjectVisibility(WorldObject* worldObje
     MT_ASSERT_WRITABLE(_selfObject);
 
     std::scoped_lock guard(_lock, other._lock);
+    if (_closed || other._closed)
+        return;
+
     _visibleWorldObjectsMap->insert(std::make_pair(worldObject->GetGUID(), worldObject));
     other._visiblePlayersMap.insert(std::make_pair(_selfObject->GetGUID(), _selfObject->ToPlayer()));
 }

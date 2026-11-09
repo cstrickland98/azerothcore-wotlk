@@ -51,6 +51,7 @@ void Corpse::AddToWorld()
     }
 
     Object::AddToWorld();
+    GetObjectVisibilityContainer().Reopen();
 }
 
 void Corpse::RemoveFromWorld()
