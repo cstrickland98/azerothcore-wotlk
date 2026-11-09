@@ -527,6 +527,8 @@ void Aura::_UnapplyForTarget(Unit* target, Unit* caster, AuraApplication* auraAp
             if (!creature)
                 return;
 
+            // Drop the infinite cooldown set on apply, a longer running cooldown would otherwise be kept
+            creature->RemoveSpellCooldown(spellInfo->Id, false);
             creature->AddSpellCooldown(spellInfo->Id, 0, 0);
 
             if (Unit* owner = creature->GetCharmerOrOwner())
@@ -1177,11 +1179,20 @@ bool Aura::ModCharges(int32 num, AuraRemoveMode removeMode)
 
 void Aura::SetStackAmount(uint8 stackAmount)
 {
+    uint8 const oldStackAmount = m_stackAmount;
     m_stackAmount = stackAmount;
     Unit* caster = GetCaster();
 
     if (!caster)
+    {
+        // can't recalc without the caster (its bonuses would be lost), so scale the current amount instead
+        if (oldStackAmount && oldStackAmount != stackAmount)
+            for (uint8 i = 0; i < MAX_SPELL_EFFECTS; ++i)
+                if (HasEffect(i))
+                    m_effects[i]->ChangeAmount(
+                        int32(int64(m_effects[i]->GetAmount()) * stackAmount / oldStackAmount), false, false);
         return;
+    }
 
     std::list<AuraApplication*> applications;
     GetApplicationList(applications);
