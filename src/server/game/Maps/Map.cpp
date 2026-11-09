@@ -972,6 +972,7 @@ void Map::FinishPhase()
 {
     std::vector<MapWorkerScratch::DeferredOp> deferred;
     std::vector<GridCoord> gridLoads;
+    std::vector<Corpse*> corpsesToDelete;
 
     for (MapWorkerScratch& scratch : _scratch)
     {
@@ -997,6 +998,7 @@ void Map::FinishPhase()
         AppendTo(_updatableRemovals, scratch.updatableRemove);
         AppendTo(gridLoads, scratch.gridLoads);
         std::move(scratch.deferred.begin(), scratch.deferred.end(), std::back_inserter(deferred));
+        AppendTo(corpsesToDelete, scratch.corpsesToDelete);
 
         if (scratch.heaviestTaskMs > _threadingStats.heaviestTaskMs)
         {
@@ -1017,6 +1019,7 @@ void Map::FinishPhase()
         scratch.updatableRemove.clear();
         scratch.gridLoads.clear();
         scratch.deferred.clear();
+        scratch.corpsesToDelete.clear();
         scratch.heaviestTaskMs = 0.0;
     }
 
@@ -1032,6 +1035,10 @@ void Map::FinishPhase()
         else if (WorldObject* obj = FindObjectForDeferredOp(op.target))
             op.fn(obj);
     }
+
+    // After the deferred ops, which may still find them through _removedThisTick
+    for (Corpse* corpse : corpsesToDelete)
+        DeleteCorpse(corpse);
 
     _threadingStats.gridLoadsDeferred += gridLoads.size();
     for (GridCoord const& gridCoord : gridLoads)
@@ -4010,10 +4017,21 @@ Corpse* Map::ConvertCorpseToBones(ObjectGuid const& ownerGuid, bool insignia /*=
     }
 
     // all references to the corpse should be removed at this point
-    ForgetRemovedThisTick(corpse);
-    delete corpse;
+    DeleteCorpse(corpse);
 
     return bones;
+}
+
+void Map::DeleteCorpse(Corpse* corpse)
+{
+    if (MapWorkerScratch* scratch = GetPhaseScratch())
+    {
+        scratch->corpsesToDelete.push_back(corpse);
+        return;
+    }
+
+    ForgetRemovedThisTick(corpse);
+    delete corpse;
 }
 
 void Map::RemoveOldCorpses()
@@ -4044,8 +4062,7 @@ void Map::RemoveOldCorpses()
     for (Corpse* bones : expiredBones)
     {
         RemoveCorpse(bones);
-        ForgetRemovedThisTick(bones);
-        delete bones;
+        DeleteCorpse(bones);
     }
 }
 
