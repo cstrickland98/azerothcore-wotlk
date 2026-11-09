@@ -19,6 +19,74 @@
 #include "MapThreading.h"
 #include "Object.h"
 #include "Player.h"
+#include <cstring>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <cstdlib>
+#endif
+
+namespace
+{
+    // Each block starts with this guard; the node handed to the container follows it (16 bytes keep the alignment)
+    struct alignas(16) BlockGuard
+    {
+        uint64 magic;
+        uint64 bytes;
+    };
+
+    constexpr uint64 BLOCK_LIVE = 0x5649534C49564521ULL;    // "VISLIVE!"
+    constexpr uint64 BLOCK_FREED = 0x564953465245452EULL;   // "VISFREE."
+
+#ifdef _WIN32
+    HANDLE GetVisibilityHeap()
+    {
+        static HANDLE const heap = []
+        {
+            HANDLE created = HeapCreate(0, 0, 0);
+            ASSERT(created, "VisibilityHeap: HeapCreate failed");
+            return created;
+        }();
+        return heap;
+    }
+#endif
+}
+
+void* VisibilityHeap::Allocate(std::size_t bytes)
+{
+#ifdef _WIN32
+    void* raw = HeapAlloc(GetVisibilityHeap(), 0, sizeof(BlockGuard) + bytes);
+#else
+    void* raw = std::malloc(sizeof(BlockGuard) + bytes);
+#endif
+    if (!raw)
+        throw std::bad_alloc();
+
+    BlockGuard* guard = static_cast<BlockGuard*>(raw);
+    guard->magic = BLOCK_LIVE;
+    guard->bytes = bytes;
+    return guard + 1;
+}
+
+void VisibilityHeap::Deallocate(void* p, std::size_t bytes)
+{
+    if (!p)
+        return;
+
+    BlockGuard* guard = static_cast<BlockGuard*>(p) - 1;
+    if (guard->magic != BLOCK_LIVE || guard->bytes != bytes)
+        ABORT("VisibilityHeap: freeing block {} of {} bytes whose guard is {:#x} / {} bytes ({})", p, bytes, guard->magic, guard->bytes,
+            guard->magic == BLOCK_FREED ? "already freed" : "overwritten");
+
+    guard->magic = BLOCK_FREED;
+    std::memset(p, 0xDB, bytes);
+#ifdef _WIN32
+    HeapFree(GetVisibilityHeap(), 0, guard);
+#else
+    std::free(guard);
+#endif
+}
 
 /*
 * Some implementation notes:
@@ -57,7 +125,7 @@ void ObjectVisibilityContainer::AssertAlive(ObjectGuid key) const
 
 void ObjectVisibilityContainer::InitForPlayer()
 {
-    _visibleWorldObjectsMap = std::make_unique<VisibleWorldObjectsMap>();
+    _visibleWorldObjectsMap.emplace();
 }
 
 void ObjectVisibilityContainer::CleanVisibilityReferences()
