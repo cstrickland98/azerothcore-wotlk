@@ -38,8 +38,10 @@ typedef std::unordered_map<ObjectGuid, Player*> VisiblePlayersMap;
 // Class that manages the visibility containers of a worldobject
 // Thread safety: with intra-map threading the maps are written from several map threads
 // (a link/unlink touches the player's map and the target's map). Every access goes through
-// _lock, and a container never holds its lock while calling into another object, so two
-// container locks are never nested. Callbacks of ForEach* run on a copy, outside the lock.
+// _lock. A link or unlink holds both containers' locks (std::scoped_lock orders them), so a
+// pair is always listed on both sides or on neither: one-sided entries become dangling pointers
+// once the unlisted side is destroyed. No lock is held while calling into another object.
+// Callbacks of ForEach* run on a copy, outside the lock.
 class ObjectVisibilityContainer
 {
 public:
@@ -148,10 +150,6 @@ private:
     // a more efficient method for cleaning up visibility references.
     // Warning: Improper use will leave dangling references and result in crashes.
     void DirectRemoveVisibilityReference(ObjectGuid guid);
-
-    // Directly inserts player visibility reference.
-    // Warning: Improper use will leave dangling references and result in crashes.
-    void DirectInsertVisiblePlayerReference(Player* player);
 
     // Directly removes player visibility reference.
     // Warning: Improper use will leave dangling references and result in crashes.
